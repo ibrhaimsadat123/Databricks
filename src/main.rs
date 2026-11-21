@@ -791,6 +791,40 @@ struct UserRow {
     top: Option<u16>,
 }
 
+
+/// Open-addressing map from linked ID to person name (only IDs whose person differs).
+struct PTab {
+    t: Vec<(u64, u64)>,
+    mask: usize,
+}
+impl PTab {
+    fn new(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(16);
+        PTab { t: vec![(u64::MAX, 0); cap], mask: cap - 1 }
+    }
+    fn insert(&mut self, k: u64, v: u64) {
+        let mut h = (mix(k) as usize) & self.mask;
+        while self.t[h].0 != u64::MAX {
+            h = (h + 1) & self.mask;
+        }
+        self.t[h] = (k, v);
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> u64 {
+        let mut h = (mix(k) as usize) & self.mask;
+        loop {
+            let s = self.t[h];
+            if s.0 == k {
+                return s.1;
+            }
+            if s.0 == u64::MAX {
+                return k;
+            }
+            h = (h + 1) & self.mask;
+        }
+    }
+}
+
 fn buckets<T>(cap: usize) -> Vec<Vec<T>> {
     (0..NB).map(|_| Vec::with_capacity(cap)).collect()
 }
@@ -820,6 +854,11 @@ fn bench(path: &str) {
     best("rows_old", &mut || { let mut c = 0u64; for_rows::<7>(b, |a| c += a[0].len() as u64); c });
     best("rows_fast", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c += a[0].len() as u64); c });
     best("+keys", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c = c.wrapping_add(key(a[0]) ^ key(a[1]) ^ key(a[5]))); c });
+    let mut dc = DC::new();
+    let mut dc2 = DC::new();
+    best("+ts_c", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c = c.wrapping_add(parse_ts_c(a[2], &mut dc).unwrap_or(0) as u64 ^ parse_ts_c(a[3], &mut dc2).unwrap_or(0) as u64)); c });
+    let mut bk: Vec<Vec<(u64, u64, u64)>> = buckets(1 << 14);
+    best("+push", &mut || { for v in bk.iter_mut() { v.clear(); } for_rows_fast::<7>(full, s0, e0, |a| { let k = key(a[0]); bk[bucket(k)].push((k, key(a[1]), 0)); }); bk.iter().map(|v| v.len() as u64).sum() });
     best("+ts", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c = c.wrapping_add(parse_ts(a[2]).unwrap_or(0) as u64 ^ parse_ts(a[3]).unwrap_or(0) as u64)); c });
 }
 
@@ -907,9 +946,10 @@ fn main() {
     camp_ch.push(b"organic".to_vec());
     let ncamp = camp_ids.len();
 
-    // ---- phase A: parse everything ----
+    // ---- chunk lists ----
     let mut files: Vec<(File, u64)> = vec![];
     let mut chunks: Vec<Chunk> = vec![];
+    let mut lchunks: Vec<Chunk> = vec![];
     let mut total_ev: u64 = 0;
     for (kind, dir) in [(Kind::Ev, "events"), (Kind::Ck, "clicks"), (Kind::Ln, "links")] {
         for p in list_csv(&data.join(dir)) {
@@ -923,10 +963,16 @@ fn main() {
             }
             let fi = files.len();
             files.push((f, len));
+            let step = if kind == Kind::Ln { 1 << 20 } else { 4 << 20 };
             let mut s = 0;
             while s < len {
-                let e = (s + (4 << 20)).min(len);
-                chunks.push(Chunk { kind, file: fi, s, e });
+                let e = (s + step).min(len);
+                let c = Chunk { kind, file: fi, s, e };
+                if kind == Kind::Ln {
+                    lchunks.push(c);
+                } else {
+                    chunks.push(c);
+                }
                 s = e;
             }
         }
@@ -934,100 +980,34 @@ fn main() {
     let est = (total_ev / 72) as usize;
     let cap = est / nt / NB + est / nt / NB / 8 + 16;
 
+    // ---- links: parse (small), then union-find on a side thread during parsing ----
+    let lparts = run(
+        nt,
+        lchunks.len(),
+        || (Vec::<u8>::new(), Vec::<(u64, u64)>::new()),
+        |st, t| {
+            let c = &lchunks[t];
+            let (f, len) = &files[c.file];
+            let (s, e) = read_chunk(f, *len, c, &mut st.0);
+            let ln = &mut st.1;
+            for_rows_fast::<2>(&st.0, s, e, |[a, bb]| {
+                if !a.is_empty() && !bb.is_empty() {
+                    ln.push((key(a), key(bb)));
+                }
+            });
+        },
+    );
+    log("links parsed");
+
     struct SA {
-        seps: Vec<u32>,
-        quotes: Vec<u32>,
         buf: Vec<u8>,
         ev: Vec<Vec<Ev>>,
         ck: Vec<Vec<Ck>>,
-        ln: Vec<(u64, u64)>,
     }
-    let sa = run(
-        nt,
-        chunks.len(),
-        || SA { seps: vec![], quotes: vec![], buf: vec![], ev: buckets(cap), ck: buckets(cap / 4), ln: vec![] },
-        |st, t| {
-            let c = &chunks[t];
-            let (f, len) = &files[c.file];
-            let (s, e) = read_chunk(f, *len, c, &mut st.buf);
-            let b = &st.buf[..];
-            match c.kind {
-                Kind::Ev => {
-                    let ev = &mut st.ev;
-                    let mut dc1 = DC::new();
-                    let mut dc2 = DC::new();
-                    for_rows_fast::<7>(b, s, e, |[eid, uid, ts, ing, et, pid, price]| {
-                        if eid.is_empty() {
-                            return;
-                        }
-                        let ek = key(eid);
-                        let ingest_ms = parse_ts_c(ing, &mut dc2).unwrap_or(i64::MAX);
-                        let ingest = (ingest_ms.saturating_sub(ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                        let mut e = Ev { eid: ek, uid: 0, ingest, ts: 0, price: 0, cat: 0, typ: 255, dead: false };
-                        'v: {
-                            if uid.is_empty() || pid.is_empty() {
-                                break 'v;
-                            }
-                            let Some(t) = parse_ts_c(ts, &mut dc1) else { break 'v };
-                            if t < ws || t >= we || ingest_ms.saturating_sub(t) > DAY {
-                                break 'v;
-                            }
-                            let typ = match et {
-                                b"view" => 0,
-                                b"cart" => 1,
-                                b"purchase" => 2,
-                                _ => break 'v,
-                            };
-                            if typ == 2 {
-                                match parse_price(price) {
-                                    Some(p) => e.price = p,
-                                    None => break 'v,
-                                }
-                            }
-                            e.ts = (t - ws) as u32;
-                            e.typ = typ;
-                            e.cat = products.get(pid).unwrap_or(unknown_cat);
-                            e.uid = key(uid);
-                        }
-                        ev[bucket(ek)].push(e);
-                    });
-                }
-                Kind::Ck => {
-                    let ck = &mut st.ck;
-                    let mut dc1 = DC::new();
-                    for_rows_fast::<4>(b, s, e, |[cid, uid, camp, ts]| {
-                        if cid.is_empty() || uid.is_empty() {
-                            return;
-                        }
-                        let Some(t) = parse_ts_c(ts, &mut dc1) else { return };
-                        if t < cws || t >= we {
-                            return;
-                        }
-                        let Some(ci) = campaigns.get(camp) else { return };
-                        let u = key(uid);
-                        ck[bucket(u)].push(Ck { person: u, cid: key(cid), ts: (t - cws) as u32, camp: ci });
-                    });
-                }
-                Kind::Ln => {
-                    let ln = &mut st.ln;
-                    for_rows_fast::<2>(b, s, e, |[a, bb]| {
-                        if !a.is_empty() && !bb.is_empty() {
-                            ln.push((key(a), key(bb)));
-                        }
-                    });
-                }
-            }
-        },
-    );
-    log("parsed");
-    if std::env::var("PARSEONLY").is_ok() { let n: usize = sa.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum(); eprintln!("events {n}"); return; }
-    if std::env::var("PARSEONLY").is_ok() { let n: usize = sa.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum(); eprintln!("events {n}"); return; }
-
-    // ---- links: union-find, alongside dedup ----
-    let (person_maps, sb) = std::thread::scope(|scope| {
-        let sa = &sa;
-        let links = scope.spawn(move || {
-            let n_l: usize = sa.iter().map(|s| s.ln.len()).sum();
+    let (ptab, sa) = std::thread::scope(|scope| {
+        let lparts = &lparts;
+        let uf = scope.spawn(move || {
+            let n_l: usize = lparts.iter().map(|s| s.1.len()).sum();
             let mut idx: FxHashMap<u64, u32> = FxHashMap::default();
             idx.reserve(n_l * 2);
             let mut keys: Vec<u64> = Vec::with_capacity(n_l * 2);
@@ -1040,8 +1020,8 @@ fn main() {
                 }
                 x
             }
-            for s in sa {
-                for &(a, b) in &s.ln {
+            for s in lparts {
+                for &(a, b) in &s.1 {
                     let mut g = |k: u64| -> u32 {
                         *idx.entry(k).or_insert_with(|| {
                             keys.push(k);
@@ -1066,107 +1046,182 @@ fn main() {
                     minkey[r] = keys[i];
                 }
             }
-            let mut maps: Vec<FxHashMap<u64, u64>> = (0..NB).map(|_| FxHashMap::default()).collect();
+            let mut t = PTab::new(keys.len());
             for i in 0..keys.len() {
                 let r = find(&mut parent, i as u32) as usize;
                 if minkey[r] != keys[i] {
-                    maps[bucket(keys[i])].insert(keys[i], minkey[r]);
+                    t.insert(keys[i], minkey[r]);
                 }
             }
-            maps
+            t
         });
 
-        // ---- phase B: dedup per eid bucket -> scatter by uid bucket ----
-        struct SB {
-            v: Vec<Ev>,
-            tab: Vec<(u64, u32)>,
-            out: Vec<Vec<PEv>>,
-        }
-        let sb = run(
+        // ---- phase A: parse events and clicks ----
+        let sa = run(
             nt,
-            NB,
-            || SB { v: vec![], tab: vec![], out: buckets(cap) },
-            |st, b| {
-                st.v.clear();
-                for s in sa {
-                    st.v.extend_from_slice(&s.ev[b]);
+            chunks.len(),
+            || SA { buf: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
+            |st, t| {
+                let c = &chunks[t];
+                let (f, len) = &files[c.file];
+                let (s, e) = read_chunk(f, *len, c, &mut st.buf);
+                let b = &st.buf[..];
+                match c.kind {
+                    Kind::Ev => {
+                        let ev = &mut st.ev;
+                        let mut dc1 = DC::new();
+                        let mut dc2 = DC::new();
+                        for_rows_fast::<7>(b, s, e, |[eid, uid, ts, ing, et, pid, price]| {
+                            if eid.is_empty() {
+                                return;
+                            }
+                            let ek = key(eid);
+                            let ingest_ms = parse_ts_c(ing, &mut dc2).unwrap_or(i64::MAX);
+                            let ingest = (ingest_ms.saturating_sub(ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                            let mut e = Ev { eid: ek, uid: 0, ingest, ts: 0, price: 0, cat: 0, typ: 255, dead: false };
+                            'v: {
+                                if uid.is_empty() || pid.is_empty() {
+                                    break 'v;
+                                }
+                                let Some(t) = parse_ts_c(ts, &mut dc1) else { break 'v };
+                                if t < ws || t >= we || ingest_ms.saturating_sub(t) > DAY {
+                                    break 'v;
+                                }
+                                let typ = match et {
+                                    b"view" => 0,
+                                    b"cart" => 1,
+                                    b"purchase" => 2,
+                                    _ => break 'v,
+                                };
+                                if typ == 2 {
+                                    match parse_price(price) {
+                                        Some(p) => e.price = p,
+                                        None => break 'v,
+                                    }
+                                }
+                                e.ts = (t - ws) as u32;
+                                e.typ = typ;
+                                if typ == 2 {
+                                    e.cat = products.get(pid).unwrap_or(unknown_cat);
+                                }
+                                e.uid = key(uid);
+                            }
+                            ev[bucket(ek)].push(e);
+                        });
+                    }
+                    Kind::Ck => {
+                        let ck = &mut st.ck;
+                        let mut dc1 = DC::new();
+                        for_rows_fast::<4>(b, s, e, |[cid, uid, camp, ts]| {
+                            if cid.is_empty() || uid.is_empty() {
+                                return;
+                            }
+                            let Some(t) = parse_ts_c(ts, &mut dc1) else { return };
+                            if t < cws || t >= we {
+                                return;
+                            }
+                            let Some(ci) = campaigns.get(camp) else { return };
+                            let u = key(uid);
+                            ck[bucket(u)].push(Ck { person: u, cid: key(cid), ts: (t - cws) as u32, camp: ci });
+                        });
+                    }
+                    Kind::Ln => {}
                 }
-                let n = st.v.len();
-                let tcap = (n * 2).next_power_of_two().max(16);
-                st.tab.clear();
-                st.tab.resize(tcap, (u64::MAX, 0));
-                let mask = tcap - 1;
-                let v = &mut st.v;
-                let tab = &mut st.tab;
-                for i in 0..n {
-                    let k = v[i].eid;
+            },
+        );
+        (uf.join().unwrap(), sa)
+    });
+    drop(lparts);
+    log("parsed");
+    if std::env::var("PARSEONLY").is_ok() {
+        return;
+    }
+
+    // ---- phase B: dedup per eid bucket, map uid -> person, scatter by person bucket ----
+    struct SB {
+        tab: Vec<(u64, u32)>,
+        dead: Vec<bool>,
+        ev: Vec<Vec<PEv>>,
+        ck: Vec<Vec<Ck>>,
+    }
+    let ptab = &ptab;
+    let sb = run(
+        nt,
+        NB,
+        || SB { tab: vec![], dead: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
+        |st, b| {
+            // virtual concatenation of every thread's bucket b
+            let parts: Vec<&[Ev]> = sa.iter().map(|s| &s.ev[b][..]).collect();
+            let n: usize = parts.iter().map(|p| p.len()).sum();
+            let tcap = (n * 2).next_power_of_two().max(16);
+            st.tab.clear();
+            st.tab.resize(tcap, (u64::MAX, 0));
+            st.dead.clear();
+            st.dead.resize(n, false);
+            let mask = tcap - 1;
+            let mut offs = Vec::with_capacity(parts.len());
+            let mut o = 0usize;
+            for p in &parts {
+                offs.push(o);
+                o += p.len();
+            }
+            let at = |g: usize| -> &Ev {
+                let mut pi = parts.len() - 1;
+                while offs[pi] > g {
+                    pi -= 1;
+                }
+                &parts[pi][g - offs[pi]]
+            };
+            let tab = &mut st.tab;
+            let dead = &mut st.dead;
+            let mut gi = 0usize;
+            for p in &parts {
+                for e in p.iter() {
+                    let k = e.eid;
                     let mut h = (mix(k) as usize) & mask;
                     loop {
                         let slot = tab[h];
                         if slot.0 == u64::MAX {
-                            tab[h] = (k, i as u32);
+                            tab[h] = (k, gi as u32);
                             break;
                         }
                         if slot.0 == k {
                             let j = slot.1 as usize;
-                            if v[i].ingest < v[j].ingest {
-                                v[j].dead = true;
-                                tab[h].1 = i as u32;
+                            if e.ingest < at(j).ingest {
+                                dead[j] = true;
+                                tab[h].1 = gi as u32;
                             } else {
-                                v[i].dead = true;
+                                dead[gi] = true;
                             }
                             break;
                         }
                         h = (h + 1) & mask;
                     }
-                }
-                for e in v.iter() {
-                    if !e.dead && e.typ != 255 {
-                        st.out[bucket(e.uid)].push(PEv { person: e.uid, ts: e.ts, price: e.price, cat: e.cat, typ: e.typ });
-                    }
-                }
-            },
-        );
-        (links.join().unwrap(), sb)
-    });
-    let sb: Vec<Vec<Vec<PEv>>> = sb.into_iter().map(|s| s.out).collect();
-    let ck_a: Vec<Vec<Vec<Ck>>> = sa.into_iter().map(|s| s.ck).collect();
-    log("dedup+links");
-
-    // ---- phase C: uid -> person, scatter by person bucket ----
-    struct SC {
-        ev: Vec<Vec<PEv>>,
-        ck: Vec<Vec<Ck>>,
-    }
-    let sc = run(
-        nt,
-        NB,
-        || SC { ev: buckets(cap), ck: buckets(cap / 4) },
-        |st, b| {
-            let m = &person_maps[b];
-            for s in &sb {
-                for e in &s[b] {
-                    let mut e = *e;
-                    if let Some(&q) = m.get(&e.person) {
-                        e.person = q;
-                    }
-                    st.ev[bucket(e.person)].push(e);
+                    gi += 1;
                 }
             }
-            for s in &ck_a {
-                for c in &s[b] {
-                    let mut c = *c;
-                    if let Some(&q) = m.get(&c.person) {
-                        c.person = q;
+            let mut gi = 0usize;
+            for p in &parts {
+                for e in p.iter() {
+                    if !dead[gi] && e.typ != 255 {
+                        let person = ptab.get(e.uid);
+                        st.ev[bucket(person)].push(PEv { person, ts: e.ts, price: e.price, cat: e.cat, typ: e.typ });
                     }
+                    gi += 1;
+                }
+            }
+            for s in sa.iter() {
+                for c in &s.ck[b] {
+                    let mut c = *c;
+                    c.person = ptab.get(c.person);
                     st.ck[bucket(c.person)].push(c);
                 }
             }
         },
     );
-    drop(sb);
-    drop(ck_a);
-    log("mapped");
+    drop(sa);
+    let sc = sb;
+    log("dedup+map");
 
     // ---- phase D: sessions + attribution per person bucket ----
     let base_day = ws.div_euclid(DAY);
@@ -1174,13 +1229,21 @@ fn main() {
     struct SD {
         ev: Vec<PEv>,
         ck: Vec<Ck>,
+        evs: Vec<PEv>,
+        cks: Vec<Ck>,
+        map: FxHashMap<u64, u32>,
+        li: Vec<u32>,
+        cli: Vec<u32>,
+        cnt: Vec<u32>,
+        eoff: Vec<u32>,
+        coff: Vec<u32>,
         users: Vec<UserRow>,
         camp: Vec<[i64; 4]>,
     }
     let sd = run(
         nt,
         NB,
-        || SD { ev: vec![], ck: vec![], users: vec![], camp: vec![[0; 4]; ncamp * ndays] },
+        || SD { ev: vec![], ck: vec![], evs: vec![], cks: vec![], map: FxHashMap::default(), li: vec![], cli: vec![], cnt: vec![], eoff: vec![], coff: vec![], users: vec![], camp: vec![[0; 4]; ncamp * ndays] },
         |st, b| {
             st.ev.clear();
             st.ck.clear();
@@ -1188,11 +1251,80 @@ fn main() {
                 st.ev.extend_from_slice(&s.ev[b]);
                 st.ck.extend_from_slice(&s.ck[b]);
             }
-            st.ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
-            st.ck.sort_unstable_by(|x, y| {
-                x.person.cmp(&y.person).then(x.ts.cmp(&y.ts)).then_with(|| cmp_key(x.cid, y.cid))
-            });
-            process_bucket(&st.ev, &st.ck, &mut st.users, &mut st.camp, ncat, ndays, ws, cws, organic, &cat_rank);
+            // group by person (order of first appearance), then sort each group by ts
+            let n = st.ev.len();
+            st.map.clear();
+            st.li.clear();
+            st.cnt.clear();
+            for e in st.ev.iter() {
+                let next = st.cnt.len() as u32;
+                let l = *st.map.entry(e.person).or_insert(next);
+                if l == next {
+                    st.cnt.push(0);
+                }
+                st.cnt[l as usize] += 1;
+                st.li.push(l);
+            }
+            let m = st.cnt.len();
+            st.eoff.clear();
+            st.eoff.push(0);
+            let mut acc = 0u32;
+            for &c in &st.cnt {
+                acc += c;
+                st.eoff.push(acc);
+            }
+            st.evs.clear();
+            st.evs.reserve(n);
+            unsafe { st.evs.set_len(n) };
+            st.cnt.copy_from_slice(&st.eoff[..m]);
+            for (i, e) in st.ev.iter().enumerate() {
+                let l = st.li[i] as usize;
+                st.evs[st.cnt[l] as usize] = *e;
+                st.cnt[l] += 1;
+            }
+            for l in 0..m {
+                let g = &mut st.evs[st.eoff[l] as usize..st.eoff[l + 1] as usize];
+                if g.len() > 1 {
+                    g.sort_unstable_by_key(|e| e.ts);
+                }
+            }
+            // clicks: same person order; clicks of persons without events are dropped
+            st.cli.clear();
+            st.cnt.clear();
+            st.cnt.resize(m, 0);
+            for c in st.ck.iter() {
+                let l = st.map.get(&c.person).copied().unwrap_or(u32::MAX);
+                st.cli.push(l);
+                if l != u32::MAX {
+                    st.cnt[l as usize] += 1;
+                }
+            }
+            st.coff.clear();
+            st.coff.push(0);
+            let mut acc = 0u32;
+            for &c in &st.cnt {
+                acc += c;
+                st.coff.push(acc);
+            }
+            let nc = acc as usize;
+            st.cks.clear();
+            st.cks.reserve(nc);
+            unsafe { st.cks.set_len(nc) };
+            st.cnt.copy_from_slice(&st.coff[..m]);
+            for (i, c) in st.ck.iter().enumerate() {
+                let l = st.cli[i];
+                if l != u32::MAX {
+                    st.cks[st.cnt[l as usize] as usize] = *c;
+                    st.cnt[l as usize] += 1;
+                }
+            }
+            for l in 0..m {
+                let g = &mut st.cks[st.coff[l] as usize..st.coff[l + 1] as usize];
+                if g.len() > 1 {
+                    g.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| cmp_key(x.cid, y.cid)));
+                }
+            }
+            process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.users, &mut st.camp, ncat, ndays, ws, cws, organic, &cat_rank);
         },
     );
     drop(sc);
@@ -1242,7 +1374,9 @@ fn main() {
 #[allow(clippy::too_many_arguments)]
 fn process_bucket(
     ev: &[PEv],
+    eoff: &[u32],
     ck: &[Ck],
+    coff: &[u32],
     users: &mut Vec<UserRow>,
     camp_out: &mut [[i64; 4]],
     ncat: usize,
@@ -1261,14 +1395,9 @@ fn process_bucket(
     let mut s_pur: Vec<bool> = vec![];
     let mut cbyc: Vec<(u16, i64)> = vec![];
     let mut cts: Vec<i64> = vec![];
-    let mut ci = 0usize;
-    let mut i = 0usize;
-    while i < ev.len() {
+    for li in 0..eoff.len() - 1 {
+        let (i, j) = (eoff[li] as usize, eoff[li + 1] as usize);
         let p = ev[i].person;
-        let mut j = i;
-        while j < ev.len() && ev[j].person == p {
-            j += 1;
-        }
         s_start.clear();
         s_day.clear();
         s_rev.clear();
@@ -1337,14 +1466,7 @@ fn process_bucket(
         }
         flush(cur_day, d_s, d_e, d_r, &mut catsum, &mut touched, users);
 
-        while ci < ck.len() && ck[ci].person < p {
-            ci += 1;
-        }
-        let c0 = ci;
-        while ci < ck.len() && ck[ci].person == p {
-            ci += 1;
-        }
-        let cl = &ck[c0..ci];
+        let cl = &ck[coff[li] as usize..coff[li + 1] as usize];
         cts.clear();
         cts.extend(cl.iter().map(|c| c.ts as i64 + cws));
         let mut q = 0usize;
@@ -1403,7 +1525,6 @@ fn process_bucket(
                 }
             }
         }
-        i = j;
     }
 }
 
