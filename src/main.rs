@@ -1369,7 +1369,54 @@ fn fuzz_rows() {
     eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
 }
 
+fn probe9() {
+    let t0 = std::time::Instant::now();
+    let runs: [(&str, &str, &str, usize); 2] = [("/scratch/g20", "20000000", "5000000", 3), ("/scratch/g60", "60000000", "15000000", 2)];
+    for (g, ev, ck, rounds) in runs {
+        let _ = std::fs::remove_dir_all(g);
+        let tg = std::time::Instant::now();
+        let st = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", ev, "--clicks", ck, "--output", g])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        eprintln!("P9 gen {ev} ok={:?} {:.1}s", st.map(|s| s.success()), tg.elapsed().as_secs_f64());
+        let variants: [(&str, &[(&str, &str)]); 2] = [("v19", &[]), ("v18", &[("SESS_SLOW", "1")])];
+        for round in 0..rounds {
+            for (name, env) in variants {
+                let _ = std::fs::remove_dir_all("/scratch/o");
+                let t = std::time::Instant::now();
+                let mut cmd = std::process::Command::new("/app/sess");
+                cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o").env("NCPU", "8");
+                for (k, v) in env { cmd.env(k, v); }
+                let out = cmd.output();
+                let wall = t.elapsed().as_secs_f64();
+                let mut ph = vec![];
+                let mut us = vec![];
+                if let Ok(o) = out {
+                    for l in String::from_utf8_lossy(&o.stderr).lines() {
+                        let w: Vec<&str> = l.split_whitespace().collect();
+                        if let Some(i) = w.iter().position(|x| *x == "wall") {
+                            ph.push(w.get(i + 1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(-1.0));
+                            let u = w.get(i + 3).map(|x| x.trim_start_matches('+')).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                            let sy = w.get(i + 5).map(|x| x.trim_start_matches('+')).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                            us.push(format!("{:.1}+{:.1}", u, sy));
+                        }
+                    }
+                }
+                let mut d: Vec<String> = vec![];
+                let mut prev = 0.0;
+                for (i, x) in ph.iter().enumerate() { d.push(format!("{:.3}({})", x - prev, us[i])); prev = *x; }
+                eprintln!("P9 {} r{round} {name} {wall:.3} {}", &ev[..2], d.join(" "));
+            }
+        }
+        let _ = std::fs::remove_dir_all(g);
+    }
+    eprintln!("P9 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::env::var_os("SESS_NO_DISPATCH").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe9();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
