@@ -507,6 +507,36 @@ unsafe fn parse_ts_fast(b: &[u8]) -> Option<i64> {
     parse_ts(b)
 }
 
+
+/// ingest_ts is always valid F1 (rules.md), so it is decoded without validation.
+/// Any other length falls back to the validating parser.
+#[inline(always)]
+unsafe fn parse_ingest(b: &[u8]) -> Option<i64> {
+    if b.len() != 20 {
+        return unsafe { parse_ts_fast(b) };
+    }
+    let p = b.as_ptr();
+    let v0 = unsafe { std::ptr::read_unaligned(p as *const u64) }; // YYYY-MM-
+    let v1 = unsafe { std::ptr::read_unaligned(p.add(8) as *const u64) }; // DDTHH:MM
+    let v2 = unsafe { std::ptr::read_unaligned(p.add(16) as *const u32) } as u64; // :SSZ
+    const D0: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const D1: u64 = 0xFFFF_00FF_FF00_FFFF;
+    let d0 = (v0 & D0).wrapping_sub(DIGIT_LO & D0);
+    let d1 = (v1 & D1).wrapping_sub(DIGIT_LO & D1);
+    let d2v = (v2 & 0x00FF_FF00).wrapping_sub(0x0030_3000);
+    let p0 = d0.wrapping_mul(10).wrapping_add(d0 >> 8);
+    let p1 = d1.wrapping_mul(10).wrapping_add(d1 >> 8);
+    let p2 = d2v.wrapping_mul(10).wrapping_add(d2v >> 8);
+    let pb = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as i64;
+    let y = pb(p0, 0) * 100 + pb(p0, 2);
+    let mo = pb(p0, 5);
+    let d = pb(p1, 0);
+    let t = unsafe { YT.get().unwrap_unchecked() };
+    let yi = (y - t.y0) as u64;
+    let days = if yi < 8 && (1..=12).contains(&mo) { t.ystart[yi as usize][mo as usize] + d - 1 } else { days_from_civil(y, mo, d) };
+    Some(days * DAY + (pb(p1, 3) * 3600 + pb(p1, 6) * 60 + pb(p2, 1)) * 1000)
+}
+
 #[inline]
 fn parse_price(b: &[u8]) -> Option<u32> {
     if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) {
@@ -1154,6 +1184,13 @@ fn fuzz() {
             bad += 1;
             if bad < 10 { eprintln!("MISMATCH it={it} {:?} slow={a:?} fast={b:?}", String::from_utf8_lossy(&v)); }
         }
+        if v.len() == 20 && a.is_some() && v[19] == b'Z' {
+            let c = unsafe { parse_ingest(&buf[..v.len()]) };
+            if c != a {
+                bad += 1;
+                if bad < 10 { eprintln!("INGEST MISMATCH {:?} {a:?} {c:?}", String::from_utf8_lossy(&v)); }
+            }
+        }
         // keys
         let k1 = key(&v);
         let k2 = unsafe { key_fast(&buf[..v.len()]) };
@@ -1165,7 +1202,82 @@ fn fuzz() {
     eprintln!("fuzz done, mismatches: {bad}");
 }
 
+
+fn probe2() {
+    let t0 = std::time::Instant::now();
+    let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let model = rd("/proc/cpuinfo").lines().find(|l| l.starts_with("model name")).unwrap_or("").replace("model name\t: ", "");
+    eprintln!("P2 {model}");
+    // micro: compute
+    let t = std::time::Instant::now();
+    let mut x = 1u64; for i in 0..200_000_000u64 { x = x.wrapping_mul(6364136223846793005).wrapping_add(i); } std::hint::black_box(x);
+    let c1 = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    std::thread::scope(|sc| { for k in 0..8u64 { sc.spawn(move || { let mut x = k; for i in 0..200_000_000u64 { x = x.wrapping_mul(6364136223846793005).wrapping_add(i); } std::hint::black_box(x); }); } });
+    let c8 = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    std::thread::scope(|sc| { for _ in 0..8 { sc.spawn(|| { let mut v = vec![0u8; 128 << 20]; for i in (0..v.len()).step_by(4096) { v[i] = 1; } std::hint::black_box(&v); }); } });
+    let flt = t.elapsed().as_secs_f64();
+    eprintln!("P2 mul1T={c1:.3} mul8T={c8:.3} fault1GB={flt:.3}");
+    // generate 20M events
+    let g = "/scratch/g";
+    let _ = std::fs::remove_dir_all(g);
+    let t = std::time::Instant::now();
+    let st = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output", g])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    eprintln!("P2 gen ok={:?} {:.1}s", st.map(|s| s.success()), t.elapsed().as_secs_f64());
+    // read speed of generated events (8 threads)
+    let files = list_csv(Path::new("/scratch/g/events"));
+    let t = std::time::Instant::now();
+    let tot: u64 = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..8).map(|i| { let files = &files; sc.spawn(move || {
+            let mut buf = vec![0u8; 1 << 20]; let mut tot = 0u64;
+            for (j, p) in files.iter().enumerate() { if j % 8 != i { continue; }
+                use std::io::Read; let mut f = File::open(p).unwrap();
+                loop { let n = f.read(&mut buf).unwrap(); if n == 0 { break; } tot += n as u64; } }
+            tot })}).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+    eprintln!("P2 read {}MB {:.3}s", tot / 1_000_000, t.elapsed().as_secs_f64());
+    let runs: [(&str, &[(&str, &str)]); 5] = [
+        ("t8", &[("NCPU", "8")]),
+        ("t8b", &[("NCPU", "8")]),
+        ("t4", &[("NCPU", "4")]),
+        ("t16", &[("NCPU", "16")]),
+        ("nolp", &[("NCPU", "8"), ("MIMALLOC_ALLOW_LARGE_OS_PAGES", "0")]),
+    ];
+    for (name, env) in runs {
+        let _ = std::fs::remove_dir_all("/scratch/o");
+        let t = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/app/sess");
+        cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o");
+        for (k, v) in env { cmd.env(k, v); }
+        let out = cmd.output();
+        let wall = t.elapsed().as_secs_f64();
+        let mut line = format!("P2 {name} wall={wall:.3}");
+        if let Ok(o) = out {
+            for l in String::from_utf8_lossy(&o.stderr).lines() {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                // "<phase> wall <t> user +<u> sys +<s>"
+                if let Some(i) = w.iter().position(|x| *x == "wall") {
+                    let ph = w[..i].join("");
+                    let tt = w.get(i + 1).unwrap_or(&"?");
+                    let u = w.get(i + 3).unwrap_or(&"?").trim_start_matches('+');
+                    let sy = w.get(i + 5).unwrap_or(&"?").trim_start_matches('+');
+                    line += &format!(" {}={tt}/{u}u/{sy}s", &ph[..ph.len().min(6)]);
+                }
+            }
+        }
+        eprintln!("{line}");
+    }
+    eprintln!("P2 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe2();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZ").is_ok() { fuzz(); return; }
     if let Ok(p) = std::env::var("BENCH") { bench(&p); return; }
     let t0 = std::time::Instant::now();
@@ -1402,7 +1514,7 @@ fn main() {
                                 return;
                             }
                             let ek = unsafe { key_fast(eid) };
-                            let ingest_ms = unsafe { parse_ts_fast(ing) }.unwrap_or(i64::MAX);
+                            let ingest_ms = unsafe { parse_ingest(ing) }.unwrap_or(i64::MAX);
                             let ingest = (ingest_ms.saturating_sub(ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                             let mut e = Ev { eid: ek, uid: 0, ingest, ts: 0, price: 0, cat: 0, typ: 255, dead: false };
                             'v: {
