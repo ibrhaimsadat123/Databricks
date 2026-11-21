@@ -1321,7 +1321,6 @@ fn main() {
 
     // ---- chunk lists ----
     let mut files: Vec<(File, u64)> = vec![];
-    let mut maps: Vec<Option<memmap2::Mmap>> = vec![];
     let mut chunks: Vec<Chunk> = vec![];
     let mut lchunks: Vec<Chunk> = vec![];
     let mut total_ev: u64 = 0;
@@ -1340,9 +1339,7 @@ fn main() {
                 total_ck += len;
             }
             let fi = files.len();
-            let mm = unsafe { memmap2::Mmap::map(&f) }.ok();
             files.push((f, len));
-            maps.push(mm);
             let step = 1 << 20;
             let mut s = 0;
             while s < len {
@@ -1445,28 +1442,9 @@ fn main() {
             |_| SA { buf: vec![], ev: buckets(cap), ck: buckets(cap_ck) },
             |st, t| {
                 let c = &chunks[t];
-                // zero-copy from the page cache (/data is tmpfs on the scorer); the tail
-                // chunk of a file is copied into a padded buffer for the 128-byte look-ahead
-                let (b, s, e): (&[u8], usize, usize) = match &maps[c.file] {
-                    Some(mm) => {
-                        let m = &mm[..];
-                        let (s0, e0) = chunk_lines(m, c);
-                        if e0 + 128 <= m.len() {
-                            populate(m, s0, e0);
-                            (m, s0, e0)
-                        } else {
-                            st.buf.clear();
-                            st.buf.extend_from_slice(&m[s0..e0]);
-                            st.buf.resize(e0 - s0 + 128, 0);
-                            (&st.buf[..], 0, e0 - s0)
-                        }
-                    }
-                    None => {
-                        let (f, len) = &files[c.file];
-                        let (s, e) = read_chunk(f, *len, c, &mut st.buf);
-                        (&st.buf[..], s, e)
-                    }
-                };
+                let (f, len) = &files[c.file];
+                let (s, e) = read_chunk(f, *len, c, &mut st.buf);
+                let b = &st.buf[..];
                 match c.kind {
                     Kind::Ev => {
                         let ev = &mut st.ev;
