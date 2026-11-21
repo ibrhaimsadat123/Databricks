@@ -19,6 +19,7 @@ static K_MMAP: LazyLock<bool> = LazyLock::new(|| knob("SESS_MMAP", 0) != 0);
 static K_POP: LazyLock<bool> = LazyLock::new(|| knob("SESS_POP", 1) != 0);
 static K_NBA: LazyLock<usize> = LazyLock::new(|| knob("SESS_NBA", 512).next_power_of_two().clamp(16, 4096));
 static K_NBD: LazyLock<usize> = LazyLock::new(|| knob("SESS_NBD", 512).next_power_of_two().clamp(16, 4096));
+static K_X: LazyLock<usize> = LazyLock::new(|| knob("SESS_X", 0));
 static K_NOCLK: LazyLock<bool> = LazyLock::new(|| knob("SESS_NOCLK", 0) != 0);
 
 const DAY: i64 = 86_400_000;
@@ -1362,7 +1363,51 @@ fn fuzz_rows() {
     eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
 }
 
+fn probe7() {
+    let t0 = std::time::Instant::now();
+    let g = "/scratch/g";
+    let _ = std::fs::remove_dir_all(g);
+    let st = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output", g])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    eprintln!("P7 gen ok={:?} {:.1}s", st.map(|s| s.success()), t0.elapsed().as_secs_f64());
+    let variants: [(&str, &[(&str, &str)]); 6] = [
+        ("base", &[]),
+        ("nodedup", &[("SESS_X", "1")]),
+        ("noptab", &[("SESS_X", "2")]),
+        ("nosort", &[("SESS_X", "4")]),
+        ("noproc", &[("SESS_X", "8")]),
+        ("noout", &[("SESS_X", "16")]),
+    ];
+    for round in 0..3 {
+        for (name, env) in variants {
+            let _ = std::fs::remove_dir_all("/scratch/o");
+            let t = std::time::Instant::now();
+            let mut cmd = std::process::Command::new("/app/sess");
+            cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o").env("NCPU", "8");
+            for (k, v) in env { cmd.env(k, v); }
+            let out = cmd.output();
+            let wall = t.elapsed().as_secs_f64();
+            let mut ph = vec![];
+            if let Ok(o) = out {
+                for l in String::from_utf8_lossy(&o.stderr).lines() {
+                    let w: Vec<&str> = l.split_whitespace().collect();
+                    if let Some(i) = w.iter().position(|x| *x == "wall") {
+                        ph.push(w.get(i + 1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(-1.0));
+                    }
+                }
+            }
+            let d: Vec<String> = ph.windows(2).map(|x| format!("{:.3}", x[1] - x[0])).collect();
+            eprintln!("P7 r{round} {name:7} {wall:.3} {}", d.join("/"));
+        }
+    }
+    eprintln!("P7 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::env::var_os("SESS_NO_DISPATCH").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe7();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
@@ -1789,7 +1834,8 @@ fn main() {
             let dead = &mut st.dead;
             let mut gi = 0usize;
             const PD: usize = 16;
-            for p in &parts {
+            let nodedup = *K_X & 1 != 0;
+            for p in parts.iter().filter(|_| !nodedup) {
                 for (pi, e) in p.iter().enumerate() {
                     if pi + PD < p.len() {
                         let hk = (mix(p[pi + PD].eid) as usize) & mask;
@@ -1825,7 +1871,7 @@ fn main() {
                         ptab.prefetch(p[pi + PD].uid);
                     }
                     if !dead[gi] && e.typ != 255 {
-                        let person = ptab.get(e.uid);
+                        let person = if *K_X & 2 != 0 { e.uid } else { ptab.get(e.uid) };
                         let aux = if e.typ == 2 {
                             st.pur.push((e.price, e.cat));
                             1 + (((st.tid as u32) << 26) | (st.pur.len() as u32 - 1))
@@ -1931,7 +1977,10 @@ fn main() {
             }
             st.k2.clear();
             st.k2.resize(n, 0);
-            {
+            if *K_X & 4 != 0 {
+                st.k2.clear();
+                st.k2.extend_from_slice(&st.k1);
+            } else {
                 let mut h = [[0u32; 2048]; 3];
                 for &k in st.k1.iter() {
                     let t = (k >> 32) as u32;
@@ -2033,7 +2082,7 @@ fn main() {
                 st.cks[st.cnt[l] as usize] = st.ck[i];
                 st.cnt[l] += 1;
             }
-            process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.users, &mut st.camp, ncat, ndays, ws, cws, organic, &cat_rank, &purs);
+            if *K_X & 8 == 0 { process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.users, &mut st.camp, ncat, ndays, ws, cws, organic, &cat_rank, &purs); }
         },
     );
     drop(sc);
@@ -2048,6 +2097,10 @@ fn main() {
         }
     }
 
+    if *K_X & 16 != 0 {
+        log("done");
+        std::process::exit(0);
+    }
     let ud = outdir.join("user_daily");
     let cd = outdir.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap();
