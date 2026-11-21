@@ -1362,7 +1362,48 @@ fn fuzz_rows() {
     eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
 }
 
+fn probe8() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    eprintln!("P8 now={now} pid={} host={}", std::process::id(), std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim());
+    // marker: does a value written now survive to a later run?
+    let marker = "/scratch/.ccni_marker";
+    let prev = std::fs::read_to_string(marker).unwrap_or_default();
+    eprintln!("P8 previous markers: {}", if prev.is_empty() { "<none>".to_string() } else { prev.lines().rev().take(5).collect::<Vec<_>>().join(" | ") });
+    let _ = std::fs::write(marker, format!("{prev}{now}\n"));
+    for l in std::fs::read_to_string("/proc/mounts").unwrap_or_default().lines().filter(|l| l.contains(" /scratch") || l.contains(" /output")) {
+        eprintln!("P8 mount {}", l.split_whitespace().take(4).collect::<Vec<_>>().join(" "));
+    }
+    let df = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    for l in df.lines().filter(|l| l.contains(" /scratch ") || l.contains(" /output ")) {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        eprintln!("P8 mountinfo root={} at={}", w.get(3).unwrap_or(&"?"), w.get(4).unwrap_or(&"?"));
+    }
+    for dir in ["/scratch", "/output"] {
+        match std::fs::read_dir(dir) {
+            Ok(rd) => {
+                let mut n = 0;
+                for e in rd.flatten() {
+                    n += 1;
+                    if n > 8 { continue; }
+                    let md = e.metadata().ok();
+                    let sz = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let mt = md.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                    eprintln!("P8 {dir}/{} size={sz} age={}s", e.file_name().to_string_lossy(), now.saturating_sub(mt));
+                }
+                eprintln!("P8 {dir}: {n} entries");
+            }
+            Err(e) => eprintln!("P8 {dir}: <{e}>"),
+        }
+    }
+
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() {
+        probe8();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
