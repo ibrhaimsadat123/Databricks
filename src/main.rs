@@ -1383,7 +1383,7 @@ fn main() {
                         let ev = &mut st.ev;
                         let mut dc1 = DC::new();
                         let mut dc2 = DC::new();
-                        for_rows_fast::<7>(b, s, e, |[eid, uid, ts, ing, et, pid, price]| {
+                        for_rows_fast::<7>(b, s, e, #[inline(always)] |[eid, uid, ts, ing, et, pid, price]| {
                             if eid.is_empty() {
                                 return;
                             }
@@ -1438,7 +1438,7 @@ fn main() {
                     Kind::Ck => {
                         let ck = &mut st.ck;
                         let mut dc1 = DC::new();
-                        for_rows_fast::<4>(b, s, e, |[cid, uid, camp, ts]| {
+                        for_rows_fast::<4>(b, s, e, #[inline(always)] |[cid, uid, camp, ts]| {
                             if cid.is_empty() || uid.is_empty() {
                                 return;
                             }
