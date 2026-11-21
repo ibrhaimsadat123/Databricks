@@ -1028,6 +1028,15 @@ struct UserRow {
 }
 
 
+
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
 /// Open-addressing map from linked ID to person name (only IDs whose person differs).
 struct PTab {
     t: Vec<(u64, u64)>,
@@ -1044,6 +1053,11 @@ impl PTab {
             h = (h + 1) & self.mask;
         }
         self.t[h] = (k, v);
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let h = (mix(k) as usize) & self.mask;
+        prefetch(unsafe { self.t.as_ptr().add(h) });
     }
     #[inline(always)]
     fn get(&self, k: u64) -> u64 {
@@ -1512,8 +1526,13 @@ fn main() {
             let tab = &mut st.tab;
             let dead = &mut st.dead;
             let mut gi = 0usize;
+            const PD: usize = 16;
             for p in &parts {
-                for e in p.iter() {
+                for (pi, e) in p.iter().enumerate() {
+                    if pi + PD < p.len() {
+                        let hk = (mix(p[pi + PD].eid) as usize) & mask;
+                        prefetch(unsafe { tab.as_ptr().add(hk) });
+                    }
                     let k = e.eid;
                     let mut h = (mix(k) as usize) & mask;
                     loop {
@@ -1539,7 +1558,10 @@ fn main() {
             }
             let mut gi = 0usize;
             for p in &parts {
-                for e in p.iter() {
+                for (pi, e) in p.iter().enumerate() {
+                    if pi + PD < p.len() {
+                        ptab.prefetch(p[pi + PD].uid);
+                    }
                     if !dead[gi] && e.typ != 255 {
                         let person = ptab.get(e.uid);
                         let aux = if e.typ == 2 {
