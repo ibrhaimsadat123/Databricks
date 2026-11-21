@@ -26,21 +26,16 @@ RUN set -e; \
       && echo "PGO profile ready" ) || echo "PGO failed, building without it"; \
     rm -rf /tmp/inst /tmp/train /tmp/out
 
-# 4. final builds (with the profile if it exists): an AVX2 entry binary and an
-#    AVX-512 (Cascade Lake) binary that the entry hands off to when the CPU supports it.
+# 4. final build (with the profile if it exists). On-scorer measurements showed the AVX2
+#    build slightly faster than an AVX-512 (Cascade Lake) build, so only AVX2 is shipped.
 RUN PGO=""; if [ -f /tmp/pgo.profdata ]; then PGO="-Cprofile-use=/tmp/pgo.profdata"; fi; \
     ( RUSTFLAGS="$BASEFLAGS $PGO" cargo build --release --locked \
       || RUSTFLAGS="$BASEFLAGS" cargo build --release --locked ) \
-    && cp target/release/sess /src/sess_v3 \
-    && ( ( RUSTFLAGS="-C target-cpu=cascadelake $PGO" cargo build --release --locked --target-dir /tmp/cl \
-           || RUSTFLAGS="-C target-cpu=cascadelake" cargo build --release --locked --target-dir /tmp/cl ) \
-         && cp /tmp/cl/release/sess /src/sess_avx512 \
-         || cp /src/sess_v3 /src/sess_avx512 )
+    && cp target/release/sess /src/sess_v3
 
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/sess_v3 /app/sess
-COPY --from=build /src/sess_avx512 /app/sess_avx512
 USER 1000
 ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 CMD ["/app/sess"]
