@@ -10,6 +10,14 @@ use std::sync::{LazyLock, Mutex};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+
+/// Tuning knobs (environment overrides, used by on-scorer experiments).
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+static K_WC: LazyLock<bool> = LazyLock::new(|| knob("SESS_WC", 1) != 0);
+static K_PD: LazyLock<usize> = LazyLock::new(|| knob("SESS_PD", 16));
+
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
@@ -1175,6 +1183,7 @@ impl PTab {
 /// cache-resident buffer and written out in whole 64-byte lines with non-temporal
 /// stores, avoiding a read-for-ownership of every destination cache line.
 struct Wc<T: Copy, const K: usize> {
+    direct: bool,
     out: Vec<Vec<T>>,
     st: Vec<[T; K]>,
     n: Vec<u8>,
@@ -1182,10 +1191,14 @@ struct Wc<T: Copy, const K: usize> {
 impl<T: Copy + Default, const K: usize> Wc<T, K> {
     fn new(cap: usize) -> Self {
         assert!(std::mem::size_of::<T>() * K == 64 && std::mem::align_of::<T>() >= 16);
-        Wc { out: buckets(cap), st: vec![[T::default(); K]; NB], n: vec![0; NB] }
+        Wc { direct: !*K_WC, out: buckets(cap), st: vec![[T::default(); K]; NB], n: vec![0; NB] }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
+        if self.direct {
+            unsafe { self.out.get_unchecked_mut(b) }.push(x);
+            return;
+        }
         unsafe {
             let c = *self.n.get_unchecked(b) as usize;
             *self.st.get_unchecked_mut(b).get_unchecked_mut(c) = x;
@@ -1220,7 +1233,7 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
         }
     }
     fn empty() -> Self {
-        Wc { out: vec![], st: vec![], n: vec![] }
+        Wc { direct: false, out: vec![], st: vec![], n: vec![] }
     }
     fn finish(mut self) -> Vec<Vec<T>> {
         for b in 0..NB {
@@ -1376,7 +1389,60 @@ fn fuzz_rows() {
     eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
 }
 
+
+fn probe3() {
+    let t0 = std::time::Instant::now();
+    let g = "/scratch/g";
+    let _ = std::fs::remove_dir_all(g);
+    let st = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output", g])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    eprintln!("P3 gen ok={:?} {:.1}s", st.map(|s| s.success()), t0.elapsed().as_secs_f64());
+    let variants: [(&str, &[(&str, &str)]); 8] = [
+        ("base", &[]),
+        ("avx2", &[("SESS_NO_DISPATCH", "1")]),
+        ("nowc", &[("SESS_WC", "0")]),
+        ("c256k", &[("SESS_CHUNK", "262144")]),
+        ("c4m", &[("SESS_CHUNK", "4194304")]),
+        ("pd0", &[("SESS_PD", "0")]),
+        ("pd32", &[("SESS_PD", "32")]),
+        ("t7", &[("NCPU", "7")]),
+    ];
+    for (name, env) in variants {
+        let mut best: Option<(f64, Vec<f64>)> = None;
+        for _ in 0..2 {
+            let _ = std::fs::remove_dir_all("/scratch/o");
+            let t = std::time::Instant::now();
+            let mut cmd = std::process::Command::new("/app/sess");
+            cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o").env("NCPU", "8");
+            for (k, v) in env { cmd.env(k, v); }
+            let out = cmd.output();
+            let wall = t.elapsed().as_secs_f64();
+            let mut ph = vec![];
+            if let Ok(o) = out {
+                for l in String::from_utf8_lossy(&o.stderr).lines() {
+                    let w: Vec<&str> = l.split_whitespace().collect();
+                    if let Some(i) = w.iter().position(|x| *x == "wall") {
+                        ph.push(w.get(i + 1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(-1.0));
+                    }
+                }
+            }
+            if best.as_ref().map(|b| wall < b.0).unwrap_or(true) {
+                best = Some((wall, ph));
+            }
+        }
+        let (w, ph) = best.unwrap();
+        // phases are cumulative: links, parsed, dedup, sessions, done
+        let d: Vec<String> = ph.windows(2).map(|x| format!("{:.3}", x[1] - x[0])).collect();
+        eprintln!("P3 {name:6} wall={w:.3} parse/dedup/sess/out={}", d.join("/"));
+    }
+    eprintln!("P3 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::env::var_os("SESS_NO_DISPATCH").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe3();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
@@ -1515,7 +1581,7 @@ fn main() {
             }
             let fi = files.len();
             files.push((f, len));
-            let step = 1 << 20;
+            let step = knob("SESS_CHUNK", 1 << 20) as u64;
             let mut s = 0;
             while s < len {
                 let e = (s + step).min(len);
@@ -1770,11 +1836,11 @@ fn main() {
             let tab = &mut st.tab;
             let dead = &mut st.dead;
             let mut gi = 0usize;
-            const PD: usize = 16;
+            let pd: usize = *K_PD;
             for p in &parts {
                 for (pi, e) in p.iter().enumerate() {
-                    if pi + PD < p.len() {
-                        let hk = (mix(p[pi + PD].eid) as usize) & mask;
+                    if pd > 0 && pi + pd < p.len() {
+                        let hk = (mix(p[pi + pd].eid) as usize) & mask;
                         prefetch(unsafe { tab.as_ptr().add(hk) });
                     }
                     let k = e.eid;
@@ -1803,8 +1869,8 @@ fn main() {
             let mut gi = 0usize;
             for p in &parts {
                 for (pi, e) in p.iter().enumerate() {
-                    if pi + PD < p.len() {
-                        ptab.prefetch(p[pi + PD].uid);
+                    if pd > 0 && pi + pd < p.len() {
+                        ptab.prefetch(p[pi + pd].uid);
                     }
                     if !dead[gi] && e.typ != 255 {
                         let person = ptab.get(e.uid);

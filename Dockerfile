@@ -41,6 +41,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/sess_v3 /app/sess
 COPY --from=build /src/sess_avx512 /app/sess_avx512
+COPY --from=build /usr/local/bin/generate /app/generate
 USER 1000
 ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 CMD ["/app/sess"]
