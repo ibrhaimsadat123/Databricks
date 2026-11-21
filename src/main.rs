@@ -835,27 +835,22 @@ fn for_rows_fast<const N: usize>(buf: &[u8], s: usize, e: usize, mut g: impl FnM
             let lp = unsafe { base.add(ls) };
             let mut a: [&[u8]; N] = [&[]; N];
             let nq = mq[0].count_ones() + mq[1].count_ones();
+            // branch-free unquoting: a field is quoted iff it starts and ends with '"' and has length >= 2
             let mut fs = 0usize;
-            if nq == 0 {
-                for k in 0..N {
-                    let fe = ends[k];
-                    a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs), fe - fs) };
-                    fs = fe + 1;
-                }
+            let mut cand = 0u32;
+            for k in 0..N {
+                let fe = ends[k];
+                let len = fe - fs;
+                let last = if len > 0 { fe - 1 } else { fs };
+                let qa = unsafe { *lp.add(fs) } == b'"';
+                let qb = unsafe { *lp.add(last) } == b'"';
+                let q = (qa & qb & (len >= 2)) as usize;
+                cand += q as u32;
+                a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + q), len - 2 * q) };
+                fs = fe + 1;
+            }
+            if nq == 2 * cand {
                 g(a);
-            } else {
-                let mut cand = 0u32;
-                for k in 0..N {
-                    let fe = ends[k];
-                    let quoted = fe >= fs + 2 && unsafe { *lp.add(fs) == b'"' && *lp.add(fe - 1) == b'"' };
-                    let (s0, l0) = if quoted { (fs + 1, fe - fs - 2) } else { (fs, fe - fs) };
-                    cand += quoted as u32;
-                    a[k] = unsafe { std::slice::from_raw_parts(lp.add(s0), l0) };
-                    fs = fe + 1;
-                }
-                if nq == 2 * cand {
-                    g(a);
-                }
             }
         }
         ls += le_off + 1;
@@ -935,6 +930,37 @@ fn read_chunk(f: &File, len: u64, c: &Chunk, buf: &mut Vec<u8>) -> (usize, usize
                 want = (want + 65536).min(len);
             }
         }
+    }
+}
+
+
+/// Line range [start, end) of the data lines that start in [c.s, c.e) of a mapped file.
+fn chunk_lines(m: &[u8], c: &Chunk) -> (usize, usize) {
+    let (s, e) = (c.s as usize, c.e as usize);
+    let a = s.saturating_sub(1);
+    let Some(p) = memchr(b'\n', &m[a..]) else { return (0, 0) };
+    let start = a + p + 1;
+    if start >= e {
+        return (0, 0);
+    }
+    let from = e - 1;
+    let end = match memchr(b'\n', &m[from..]) {
+        Some(q) => from + q + 1,
+        None => m.len(),
+    };
+    (start, end)
+}
+
+#[inline]
+fn populate(m: &[u8], s: usize, e: usize) {
+    if e <= s {
+        return;
+    }
+    unsafe {
+        let base = m.as_ptr() as usize + s;
+        let al = base & !4095;
+        // MADV_POPULATE_READ = 22 (Linux 5.14+); errors are ignored
+        libc::madvise(al as *mut libc::c_void, e - s + (base - al), 22);
     }
 }
 
@@ -1447,11 +1473,17 @@ fn main() {
         ck: Vec<Vec<Ck>>,
     }
     let ptab = &ptab;
+    let border: Vec<usize> = {
+        let mut v: Vec<(usize, usize)> = (0..NB).map(|b| (sa.iter().map(|s| s.ev[b].len()).sum::<usize>(), b)).collect();
+        v.sort_unstable_by(|x, y| y.cmp(x));
+        v.into_iter().map(|x| x.1).collect()
+    };
     let mut sb = run(
         nt,
         NB,
         |tid| SB { tid, pur: Vec::with_capacity(est / nt / 20 + 64), tab: vec![], dead: vec![], ev: buckets(cap), ck: buckets(cap_ck) },
-        |st, b| {
+        |st, t| {
+            let b = border[t];
             // virtual concatenation of every thread's bucket b
             let parts: Vec<&[Ev]> = sa.iter().map(|s| &s.ev[b][..]).collect();
             let n: usize = parts.iter().map(|p| p.len()).sum();
@@ -1554,11 +1586,19 @@ fn main() {
         users: Vec<UserRow>,
         camp: Vec<[i64; 4]>,
     }
+    let dorder: Vec<usize> = {
+        let mut v: Vec<(usize, usize)> = (0..NB)
+            .map(|b| (sc.iter().map(|s| s.ev[b].len() + s.ck[b].len()).sum::<usize>(), b))
+            .collect();
+        v.sort_unstable_by(|x, y| y.cmp(x));
+        v.into_iter().map(|x| x.1).collect()
+    };
     let sd = run(
         nt,
         NB,
         |_| SD { ev: vec![], ck: vec![], evs: vec![], cks: vec![], k1: vec![], k2: vec![], map: FxHashMap::default(), li: vec![], cli: vec![], cnt: vec![], eoff: vec![], coff: vec![], users: Vec::with_capacity(est / nt / 8 + 64), camp: vec![[0; 4]; ncamp * ndays] },
-        |st, b| {
+        |st, t| {
+            let b = dorder[t];
             st.ck.clear();
             for s in &sc {
                 st.ck.extend_from_slice(&s.ck[b]);
@@ -1641,15 +1681,19 @@ fn main() {
                 st.evs[st.cnt[l] as usize] = parts[pi][i];
                 st.cnt[l] += 1;
             }
-            // clicks: same person order; clicks of persons without events are dropped
+            // clicks: same person order; clicks of persons without events are dropped.
+            // Radix-sort by ts, then stable placement by person: groups come out ts-sorted.
+            // (Ties in ts are resolved by click_id at credit time.)
             st.cli.clear();
             st.cnt.clear();
             st.cnt.resize(m, 0);
-            for c in st.ck.iter() {
+            st.k1.clear();
+            for (i, c) in st.ck.iter().enumerate() {
                 let l = st.map.get(&c.person).copied().unwrap_or(u32::MAX);
                 st.cli.push(l);
                 if l != u32::MAX {
                     st.cnt[l as usize] += 1;
+                    st.k1.push(((c.ts as u64) << 32) | i as u64);
                 }
             }
             st.coff.clear();
@@ -1660,22 +1704,44 @@ fn main() {
                 st.coff.push(acc);
             }
             let nc = acc as usize;
+            st.k2.clear();
+            st.k2.resize(nc, 0);
+            {
+                let mut h = [[0u32; 2048]; 3];
+                for &k in st.k1.iter() {
+                    let t = (k >> 32) as u32;
+                    h[0][(t & 2047) as usize] += 1;
+                    h[1][((t >> 11) & 2047) as usize] += 1;
+                    h[2][(t >> 22) as usize & 2047] += 1;
+                }
+                for p in 0..3 {
+                    let mut sum = 0u32;
+                    for x in h[p].iter_mut() {
+                        let c = *x;
+                        *x = sum;
+                        sum += c;
+                    }
+                }
+                for p in 0..3 {
+                    let (src, dst) = if p % 2 == 0 { (&st.k1, &mut st.k2) } else { (&st.k2, &mut st.k1) };
+                    let sh = 32 + 11 * p as u32;
+                    let hp = &mut h[p];
+                    for &k in src.iter() {
+                        let d = ((k >> sh) & 2047) as usize;
+                        dst[hp[d] as usize] = k;
+                        hp[d] += 1;
+                    }
+                }
+            }
             st.cks.clear();
             st.cks.reserve(nc);
             unsafe { st.cks.set_len(nc) };
             st.cnt.copy_from_slice(&st.coff[..m]);
-            for (i, c) in st.ck.iter().enumerate() {
-                let l = st.cli[i];
-                if l != u32::MAX {
-                    st.cks[st.cnt[l as usize] as usize] = *c;
-                    st.cnt[l as usize] += 1;
-                }
-            }
-            for l in 0..m {
-                let g = &mut st.cks[st.coff[l] as usize..st.coff[l + 1] as usize];
-                if g.len() > 1 {
-                    g.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| cmp_key(x.cid, y.cid)));
-                }
+            for &k in st.k2.iter() {
+                let i = (k & 0xFFFF_FFFF) as usize;
+                let l = st.cli[i] as usize;
+                st.cks[st.cnt[l] as usize] = st.ck[i];
+                st.cnt[l] += 1;
             }
             process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.users, &mut st.camp, ncat, ndays, ws, cws, organic, &cat_rank, &purs);
         },
@@ -1748,7 +1814,8 @@ fn process_bucket(
     let mut s_day: Vec<usize> = vec![];
     let mut s_rev: Vec<i64> = vec![];
     let mut s_pur: Vec<bool> = vec![];
-    let mut cbyc: Vec<(u16, i64)> = vec![];
+    let mut covered: Vec<(u32, u32)> = vec![(0, 0); organic as usize + 2];
+    let mut pstamp: u32 = 0;
     let mut cts: Vec<i64> = vec![];
     for li in 0..eoff.len() - 1 {
         let (i, j) = (eoff[li] as usize, eoff[li + 1] as usize);
@@ -1835,11 +1902,15 @@ fn process_bucket(
             let mut camp = organic;
             if q > 0 && st - cts[q - 1] <= WEEK {
                 let t = cts[q - 1];
+                let mut best = q - 1;
                 let mut r = q - 1;
                 while r > 0 && cts[r - 1] == t {
                     r -= 1;
+                    if cmp_key(cl[r].cid, cl[best].cid) == Ordering::Less {
+                        best = r;
+                    }
                 }
-                camp = cl[r].camp;
+                camp = cl[best].camp;
             }
             let a = &mut camp_out[camp as usize * ndays + s_day[s]];
             a[0] += 1;
@@ -1847,38 +1918,34 @@ fn process_bucket(
             a[2] += s_rev[s];
         }
         if !cl.is_empty() && !s_start.is_empty() {
-            cbyc.clear();
-            cbyc.extend(cl.iter().zip(cts.iter()).map(|(c, &t)| (c.camp, t)));
-            cbyc.sort_unstable();
-            let mut x = 0;
-            while x < cbyc.len() {
-                let camp = cbyc[x].0;
-                let mut lo = cbyc[x].1;
-                let mut hi = lo + WEEK;
-                x += 1;
-                loop {
-                    let more = x < cbyc.len() && cbyc[x].0 == camp;
-                    if more && cbyc[x].1 <= hi {
-                        hi = cbyc[x].1 + WEEK;
-                        x += 1;
-                        continue;
+            // assists: clicks are ts-sorted, so the session window [t, t + 7d] only moves right.
+            // covered[k] = first session index not yet counted for campaign k (per person).
+            pstamp += 1;
+            let ns = s_start.len();
+            let (mut lo, mut hi) = (0usize, 0usize);
+            for (c, &t) in cl.iter().zip(cts.iter()) {
+                while lo < ns && s_start[lo] < t {
+                    lo += 1;
+                }
+                if hi < lo {
+                    hi = lo;
+                }
+                while hi < ns && s_start[hi] <= t + WEEK {
+                    hi += 1;
+                }
+                let k = c.camp as usize;
+                let cv = &mut covered[k];
+                let from = if cv.0 == pstamp { lo.max(cv.1 as usize) } else { lo };
+                *cv = (pstamp, hi.max(if cv.0 == pstamp { cv.1 as usize } else { 0 }) as u32);
+                let mut x = from;
+                while x < hi {
+                    let d = s_day[x];
+                    let mut y = x + 1;
+                    while y < hi && s_day[y] == d {
+                        y += 1;
                     }
-                    let a = s_start.partition_point(|&v| v < lo);
-                    let z = s_start.partition_point(|&v| v <= hi);
-                    let mut s = a;
-                    while s < z {
-                        let d = s_day[s];
-                        let e = s + s_day[s..z].partition_point(|&dd| dd == d);
-                        camp_out[camp as usize * ndays + d][3] += (e - s) as i64;
-                        s = e;
-                    }
-                    if more {
-                        lo = cbyc[x].1;
-                        hi = lo + WEEK;
-                        x += 1;
-                        continue;
-                    }
-                    break;
+                    camp_out[k * ndays + d][3] += (y - x) as i64;
+                    x = y;
                 }
             }
         }
