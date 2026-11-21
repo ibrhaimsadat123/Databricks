@@ -798,6 +798,26 @@ fn masks128(p: &[u8]) -> ([u64; 2], [u64; 2], [u64; 2]) {
     }
 }
 
+
+#[inline(always)]
+fn pext64(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        return std::arch::x86_64::_pext_u64(x, m);
+    }
+    #[allow(unreachable_code)]
+    {
+        let (mut r, mut bit, mut mm) = (0u64, 0u32, m);
+        while mm != 0 {
+            let t = mm.trailing_zeros();
+            r |= ((x >> t) & 1) << bit;
+            bit += 1;
+            mm &= mm - 1;
+        }
+        r
+    }
+}
+
 #[inline(always)]
 fn low_mask(k: usize) -> u64 {
     if k >= 64 { u64::MAX } else { (1u64 << k) - 1 }
@@ -865,22 +885,59 @@ fn for_rows_fast<const N: usize>(buf: &[u8], s: usize, e: usize, mut g: impl FnM
             let lp = unsafe { base.add(ls) };
             let mut a: [&[u8]; N] = [&[]; N];
             let nq = mq[0].count_ones() + mq[1].count_ones();
-            // branch-free unquoting: a field is quoted iff it starts and ends with '"' and has length >= 2
-            let mut fs = 0usize;
-            let mut cand = 0u32;
-            for k in 0..N {
-                let fe = ends[k];
-                let len = fe - fs;
-                let last = if len > 0 { fe - 1 } else { fs };
-                let qa = unsafe { *lp.add(fs) } == b'"';
-                let qb = unsafe { *lp.add(last) } == b'"';
-                let q = (qa & qb & (len >= 2)) as usize;
-                cand += q as u32;
-                a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + q), len - 2 * q) };
-                fs = fe + 1;
-            }
-            if nq == 2 * cand {
+            if nq == 0 {
+                let mut fs = 0usize;
+                for k in 0..N {
+                    let fe = ends[k];
+                    a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs), fe - fs) };
+                    fs = fe + 1;
+                }
                 g(a);
+            } else if le_off < 127 {
+                // Whole-line quote validation with bitmasks. A line is valid iff every quote is the
+                // first or last char of its field, a field starts with a quote iff it ends with one,
+                // and quoted fields have length >= 2 (so their two quotes are distinct).
+                let sm = [(mc[0] << 1) | 1, (mc[1] << 1) | (mc[0] >> 63)]; // field starts
+                let em = {
+                    // separator after each field (commas and the line end)
+                    let mut x = [mc[0], mc[1]];
+                    x[le_off >> 6] |= 1u64 << (le_off & 63);
+                    x
+                };
+                let last = [(em[0] >> 1) | (em[1] << 63), em[1] >> 1]; // last char of each field
+                let qs = [mq[0] & sm[0], mq[1] & sm[1]];
+                let ql = [mq[0] & last[0], mq[1] & last[1]];
+                let qe = [(mq[0] << 1) & em[0], ((mq[1] << 1) | (mq[0] >> 63)) & em[1]];
+                let fsb = pext64(qs[0], sm[0]) | (pext64(qs[1], sm[1]) << sm[0].count_ones());
+                let feb = pext64(qe[0], em[0]) | (pext64(qe[1], em[1]) << em[0].count_ones());
+                let ok = (qs[0] | ql[0]) == mq[0] && (qs[1] | ql[1]) == mq[1] && fsb == feb && nq == 2 * fsb.count_ones();
+                if ok {
+                    let mut fs = 0usize;
+                    for k in 0..N {
+                        let fe = ends[k];
+                        let q = ((fsb >> k) & 1) as usize;
+                        a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + q), fe - fs - 2 * q) };
+                        fs = fe + 1;
+                    }
+                    g(a);
+                }
+            } else {
+                let mut fs = 0usize;
+                let mut cand = 0u32;
+                for k in 0..N {
+                    let fe = ends[k];
+                    let len = fe - fs;
+                    let last = if len > 0 { fe - 1 } else { fs };
+                    let qa = unsafe { *lp.add(fs) } == b'"';
+                    let qb = unsafe { *lp.add(last) } == b'"';
+                    let q = (qa & qb & (len >= 2)) as usize;
+                    cand += q as u32;
+                    a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + q), len - 2 * q) };
+                    fs = fe + 1;
+                }
+                if nq == 2 * cand {
+                    g(a);
+                }
             }
         }
         ls += le_off + 1;
@@ -1011,6 +1068,11 @@ fn run<S: Send>(nt: usize, ntasks: usize, init: impl Fn(usize) -> S + Sync, f: i
                             break;
                         }
                         f(&mut s, t);
+                        // order any non-temporal stores of this task before other threads read them
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            std::arch::x86_64::_mm_sfence();
+                        }
                     }
                     s
                 })
@@ -1021,7 +1083,8 @@ fn run<S: Send>(nt: usize, ntasks: usize, init: impl Fn(usize) -> S + Sync, f: i
 }
 
 // ---------- records ----------
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(align(32))]
 struct Ev {
     eid: u64,
     uid: u64,
@@ -1033,14 +1096,16 @@ struct Ev {
     dead: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(align(16))]
 struct PEv {
     person: u64,
     ts: u32,
     aux: u32, // 0 = not a purchase, else 1 + (tid << 26 | idx) into the purchase side tables
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(align(32))]
 struct Ck {
     person: u64,
     cid: u64,
@@ -1102,6 +1167,72 @@ impl PTab {
             }
             h = (h + 1) & self.mask;
         }
+    }
+}
+
+
+/// Software write-combining scatter: records for each bucket are staged in a small
+/// cache-resident buffer and written out in whole 64-byte lines with non-temporal
+/// stores, avoiding a read-for-ownership of every destination cache line.
+struct Wc<T: Copy, const K: usize> {
+    out: Vec<Vec<T>>,
+    st: Vec<[T; K]>,
+    n: Vec<u8>,
+}
+impl<T: Copy + Default, const K: usize> Wc<T, K> {
+    fn new(cap: usize) -> Self {
+        assert!(std::mem::size_of::<T>() * K == 64 && std::mem::align_of::<T>() >= 16);
+        Wc { out: buckets(cap), st: vec![[T::default(); K]; NB], n: vec![0; NB] }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        unsafe {
+            let c = *self.n.get_unchecked(b) as usize;
+            *self.st.get_unchecked_mut(b).get_unchecked_mut(c) = x;
+            if c + 1 == K {
+                self.flush(b);
+            } else {
+                *self.n.get_unchecked_mut(b) = (c + 1) as u8;
+            }
+        }
+    }
+    #[inline(always)]
+    fn flush(&mut self, b: usize) {
+        unsafe {
+            let v = self.out.get_unchecked_mut(b);
+            if v.capacity() - v.len() < K {
+                v.reserve(K.max(v.len()));
+            }
+            let len = v.len();
+            let dst = v.as_mut_ptr().add(len) as *mut u8;
+            let src = self.st.get_unchecked(b).as_ptr() as *const u8;
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::*;
+                for i in 0..4 {
+                    _mm_stream_si128(dst.add(16 * i) as *mut __m128i, _mm_load_si128(src.add(16 * i) as *const __m128i));
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            std::ptr::copy_nonoverlapping(src, dst, 64);
+            v.set_len(len + K);
+            *self.n.get_unchecked_mut(b) = 0;
+        }
+    }
+    fn empty() -> Self {
+        Wc { out: vec![], st: vec![], n: vec![] }
+    }
+    fn finish(mut self) -> Vec<Vec<T>> {
+        for b in 0..NB {
+            let c = self.n[b] as usize;
+            let st = self.st[b];
+            self.out[b].extend_from_slice(&st[..c]);
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+        self.out
     }
 }
 
@@ -1202,7 +1333,51 @@ fn fuzz() {
     eprintln!("fuzz done, mismatches: {bad}");
 }
 
+
+fn fuzz_rows() {
+    let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+    let atoms: [&[u8]; 12] = [b"u1", b"", b"\"", b"\"\"", b"abc", b"\"x\"", b"x\"", b"\"x", b"a\"b", b"2026-10-03T23:58:10Z", b"1791071890000", b" q "];
+    let mut bad = 0u64;
+    let mut total = 0u64;
+    for it in 0..3_000_000u64 {
+        // build a chunk of 1..6 lines with 5..9 fields, random quoting
+        let mut chunk: Vec<u8> = vec![];
+        let nl = 1 + next() % 6;
+        for _ in 0..nl {
+            let nf = if next() % 5 == 0 { 5 + next() % 5 } else { 7 };
+            for f in 0..nf {
+                if f > 0 { chunk.push(b','); }
+                let a = atoms[(next() % atoms.len() as u64) as usize];
+                if next() % 4 == 0 && !a.contains(&b'"') { chunk.push(b'"'); chunk.extend_from_slice(a); chunk.push(b'"'); } else { chunk.extend_from_slice(a); }
+                if next() % 50 == 0 { for _ in 0..(next() % 40) { chunk.push(b'y'); } }
+            }
+            if next() % 30 != 0 { chunk.push(b'\n'); }
+        }
+        let e = chunk.len();
+        let mut buf = chunk.clone();
+        for _ in 0..128 { buf.push((next() & 0xff) as u8); }
+        let mut fast: Vec<Vec<Vec<u8>>> = vec![];
+        for_rows_fast::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect()));
+        let mut slow: Vec<Vec<Vec<u8>>> = vec![];
+        let mut f = [(0usize, 0usize); 7];
+        let mut i = 0;
+        while i < e {
+            let (ni, ok) = next_line::<7>(&chunk[..e], i, &mut f);
+            if ok { slow.push(f.iter().map(|&(a, b)| chunk[a..b].to_vec()).collect()); }
+            i = ni;
+        }
+        total += slow.len() as u64;
+        if fast != slow {
+            bad += 1;
+            if bad < 5 { eprintln!("ROW MISMATCH it={it} chunk={:?}\n fast={:?}\n slow={:?}", String::from_utf8_lossy(&chunk), fast, slow); }
+        }
+    }
+    eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
+}
+
 fn main() {
+    if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
@@ -1380,6 +1555,8 @@ fn main() {
 
     struct SA {
         buf: Vec<u8>,
+        wc: Wc<Ev, 2>,
+        wck: Wc<Ck, 2>,
         ev: Vec<Vec<Ev>>,
         ck: Vec<Vec<Ck>>,
     }
@@ -1439,7 +1616,7 @@ fn main() {
         let sa = run(
             nt,
             chunks.len(),
-            |_| SA { buf: vec![], ev: buckets(cap), ck: buckets(cap_ck) },
+            |_| SA { buf: vec![], wc: Wc::new(cap), wck: Wc::new(cap_ck), ev: vec![], ck: vec![] },
             |st, t| {
                 let c = &chunks[t];
                 let (f, len) = &files[c.file];
@@ -1447,7 +1624,7 @@ fn main() {
                 let b = &st.buf[..];
                 match c.kind {
                     Kind::Ev => {
-                        let ev = &mut st.ev;
+                        let ev = &mut st.wc;
                         let mut dc1 = DC::new();
                         let mut dc2 = DC::new();
                         for_rows_fast::<7>(b, s, e, #[inline(always)] |[eid, uid, ts, ing, et, pid, price]| {
@@ -1499,11 +1676,11 @@ fn main() {
                                 }
                                 e.uid = unsafe { key_fast(uid) };
                             }
-                            ev[bucket(ek)].push(e);
+                            ev.push(bucket(ek), e);
                         });
                     }
                     Kind::Ck => {
-                        let ck = &mut st.ck;
+                        let ck = &mut st.wck;
                         let mut dc1 = DC::new();
                         for_rows_fast::<4>(b, s, e, #[inline(always)] |[cid, uid, camp, ts]| {
                             if cid.is_empty() || uid.is_empty() {
@@ -1515,13 +1692,25 @@ fn main() {
                             }
                             let Some(ci) = campaigns.get(camp) else { return };
                             let u = unsafe { key_fast(uid) };
-                            ck[bucket(u)].push(Ck { person: u, cid: unsafe { key_fast(cid) }, ts: (t - cws) as u32, camp: ci });
+                            ck.push(bucket(u), Ck { person: u, cid: unsafe { key_fast(cid) }, ts: (t - cws) as u32, camp: ci });
                         });
                     }
                     Kind::Ln => {}
                 }
+                // order this task's non-temporal stores before other threads read them
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_sfence();
+                }
             },
         );
+        let mut sa = sa;
+        for s in sa.iter_mut() {
+            let w = std::mem::replace(&mut s.wc, Wc::empty());
+            s.ev = w.finish();
+            let w = std::mem::replace(&mut s.wck, Wc::empty());
+            s.ck = w.finish();
+        }
         (uf.join().unwrap(), sa)
     });
     drop(lparts);
@@ -1536,6 +1725,8 @@ fn main() {
         pur: Vec<(u32, u16)>,
         tab: Vec<(u64, u32, u32)>,
         dead: Vec<bool>,
+        wev: Wc<PEv, 4>,
+        wck: Wc<Ck, 2>,
         ev: Vec<Vec<PEv>>,
         ck: Vec<Vec<Ck>>,
     }
@@ -1548,7 +1739,7 @@ fn main() {
     let mut sb = run(
         nt,
         NB,
-        |tid| SB { tid, pur: Vec::with_capacity(est / nt / 20 + 64), tab: vec![], dead: vec![], ev: buckets(cap), ck: buckets(cap_ck) },
+        |tid| SB { tid, pur: Vec::with_capacity(est / nt / 20 + 64), tab: vec![], dead: vec![], wev: Wc::new(cap), wck: Wc::new(cap_ck), ev: vec![], ck: vec![] },
         |st, t| {
             let b = border[t];
             // virtual concatenation of every thread's bucket b
@@ -1623,7 +1814,7 @@ fn main() {
                         } else {
                             0
                         };
-                        st.ev[bucket(person)].push(PEv { person, ts: e.ts, aux });
+                        st.wev.push(bucket(person), PEv { person, ts: e.ts, aux });
                     }
                     gi += 1;
                 }
@@ -1632,12 +1823,18 @@ fn main() {
                 for c in &s.ck[b] {
                     let mut c = *c;
                     c.person = ptab.get(c.person);
-                    st.ck[bucket(c.person)].push(c);
+                    st.wck.push(bucket(c.person), c);
                 }
             }
         },
     );
     drop(sa);
+    for s in sb.iter_mut() {
+        let w = std::mem::replace(&mut s.wev, Wc::empty());
+        s.ev = w.finish();
+        let w = std::mem::replace(&mut s.wck, Wc::empty());
+        s.ck = w.finish();
+    }
     let purs: Vec<Vec<(u32, u16)>> = sb.iter_mut().map(|s| std::mem::take(&mut s.pur)).collect();
     let sc = sb;
     log("dedup+map");
