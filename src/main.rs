@@ -10,6 +10,17 @@ use std::sync::{LazyLock, Mutex};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+
+/// Tuning knobs (environment overrides, used by on-scorer experiments).
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+static K_MMAP: LazyLock<bool> = LazyLock::new(|| knob("SESS_MMAP", 0) != 0);
+static K_POP: LazyLock<bool> = LazyLock::new(|| knob("SESS_POP", 1) != 0);
+static K_NBA: LazyLock<usize> = LazyLock::new(|| knob("SESS_NBA", 512).next_power_of_two().clamp(16, 4096));
+static K_NBD: LazyLock<usize> = LazyLock::new(|| knob("SESS_NBD", 512).next_power_of_two().clamp(16, 4096));
+static K_NOCLK: LazyLock<bool> = LazyLock::new(|| knob("SESS_NOCLK", 0) != 0);
+
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
@@ -137,6 +148,11 @@ fn mix(k: u64) -> u64 {
 #[inline(always)]
 fn bucket(k: u64) -> usize {
     (mix(k) >> 56) as usize
+}
+/// bucket among 2^(64 - sh) buckets
+#[inline(always)]
+fn bucket_sh(k: u64, sh: u32) -> usize {
+    (mix(k) >> sh) as usize
 }
 
 // ---------- timestamps ----------
@@ -1180,9 +1196,9 @@ struct Wc<T: Copy, const K: usize> {
     n: Vec<u8>,
 }
 impl<T: Copy + Default, const K: usize> Wc<T, K> {
-    fn new(cap: usize) -> Self {
+    fn new(nb: usize, cap: usize) -> Self {
         assert!(std::mem::size_of::<T>() * K == 64 && std::mem::align_of::<T>() >= 16);
-        Wc { out: buckets(cap), st: vec![[T::default(); K]; NB], n: vec![0; NB] }
+        Wc { out: buckets_n(nb, cap), st: vec![[T::default(); K]; nb], n: vec![0; nb] }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
@@ -1223,7 +1239,7 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
         Wc { out: vec![], st: vec![], n: vec![] }
     }
     fn finish(mut self) -> Vec<Vec<T>> {
-        for b in 0..NB {
+        for b in 0..self.n.len() {
             let c = self.n[b] as usize;
             let st = self.st[b];
             self.out[b].extend_from_slice(&st[..c]);
@@ -1237,40 +1253,10 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
 }
 
 fn buckets<T>(cap: usize) -> Vec<Vec<T>> {
-    (0..NB).map(|_| Vec::with_capacity(cap)).collect()
+    buckets_n(NB, cap)
 }
-
-
-fn bench(path: &str) {
-    let mut b = std::fs::read(path).unwrap();
-    let h = memchr(b'\n', &b).unwrap();
-    let e0 = b.len();
-    b.extend_from_slice(&[0u8; 128]);
-    let full = &b[..];
-    let b = &full[h + 1..e0];
-    let (s0, e0) = (h + 1, e0);
-    let mut seps = vec![];
-    let mut quotes = vec![];
-    let best = |name: &str, f: &mut dyn FnMut() -> u64| {
-        let mut m = f64::MAX;
-        let mut r = 0;
-        for _ in 0..7 {
-            let t = std::time::Instant::now();
-            r = f();
-            m = m.min(t.elapsed().as_secs_f64());
-        }
-        eprintln!("{name:12} {:.1} ms  ({:.0} MB/s) r={r}", m * 1e3, b.len() as f64 / m / 1e6);
-    };
-    best("scan", &mut || { scan(b, &mut seps, &mut quotes); seps.len() as u64 });
-    best("rows_old", &mut || { let mut c = 0u64; for_rows::<7>(b, |a| c += a[0].len() as u64); c });
-    best("rows_fast", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c += a[0].len() as u64); c });
-    best("+keys", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c = c.wrapping_add(key(a[0]) ^ key(a[1]) ^ key(a[5]))); c });
-    let mut dc = DC::new();
-    let mut dc2 = DC::new();
-    best("+ts_c", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c = c.wrapping_add(parse_ts_c(a[2], &mut dc).unwrap_or(0) as u64 ^ parse_ts_c(a[3], &mut dc2).unwrap_or(0) as u64)); c });
-    let mut bk: Vec<Vec<(u64, u64, u64)>> = buckets(1 << 14);
-    best("+push", &mut || { for v in bk.iter_mut() { v.clear(); } for_rows_fast::<7>(full, s0, e0, |a| { let k = key(a[0]); bk[bucket(k)].push((k, key(a[1]), 0)); }); bk.iter().map(|v| v.len() as u64).sum() });
-    best("+ts", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c = c.wrapping_add(parse_ts(a[2]).unwrap_or(0) as u64 ^ parse_ts(a[3]).unwrap_or(0) as u64)); c });
+fn buckets_n<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
+    (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
 
 
@@ -1395,7 +1381,6 @@ fn main() {
         }
     }
     if std::env::var("FUZZ").is_ok() { fuzz(); return; }
-    if let Ok(p) = std::env::var("BENCH") { bench(&p); return; }
     let t0 = std::time::Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
@@ -1496,6 +1481,7 @@ fn main() {
 
     // ---- chunk lists ----
     let mut files: Vec<(File, u64)> = vec![];
+    let mut maps: Vec<Option<memmap2::Mmap>> = vec![];
     let mut chunks: Vec<Chunk> = vec![];
     let mut lchunks: Vec<Chunk> = vec![];
     let mut total_ev: u64 = 0;
@@ -1514,7 +1500,9 @@ fn main() {
                 total_ck += len;
             }
             let fi = files.len();
+            let mm = if *K_MMAP && kind != Kind::Ln { unsafe { memmap2::Mmap::map(&f) }.ok() } else { None };
             files.push((f, len));
+            maps.push(mm);
             let step = 1 << 20;
             let mut s = 0;
             while s < len {
@@ -1530,9 +1518,15 @@ fn main() {
         }
     }
     let est = (total_ev / 70) as usize;
-    let cap = est / nt / NB + est / nt / NB / 4 + 64;
+    let nba = *K_NBA;
+    let nbd = *K_NBD;
+    let sha = 64 - nba.trailing_zeros();
+    let shd = 64 - nbd.trailing_zeros();
+    let cap = est / nt / nba + est / nt / nba / 4 + 64;
+    let capd = est / nt / nbd + est / nt / nbd / 4 + 64;
     let est_ck = (total_ck / 46) as usize;
-    let cap_ck = est_ck / nt / NB + est_ck / nt / NB / 4 + 64;
+    let cap_ck = est_ck / nt / nba + est_ck / nt / nba / 4 + 64;
+    let capd_ck = est_ck / nt / nbd + est_ck / nt / nbd / 4 + 64;
 
     // ---- links: parse (small), then union-find on a side thread during parsing ----
     let lparts = run(
@@ -1616,12 +1610,36 @@ fn main() {
         let sa = run(
             nt,
             chunks.len(),
-            |_| SA { buf: vec![], wc: Wc::new(cap), wck: Wc::new(cap_ck), ev: vec![], ck: vec![] },
+            |_| SA { buf: vec![], wc: Wc::new(nba, cap), wck: Wc::new(nba, cap_ck), ev: vec![], ck: vec![] },
             |st, t| {
                 let c = &chunks[t];
-                let (f, len) = &files[c.file];
-                let (s, e) = read_chunk(f, *len, c, &mut st.buf);
-                let b = &st.buf[..];
+                if *K_NOCLK && c.kind == Kind::Ck {
+                    return;
+                }
+                // optional zero-copy from the page cache; the tail chunk of a file is copied
+                // into a padded buffer for the 128-byte look-ahead
+                let (b, s, e): (&[u8], usize, usize) = match &maps[c.file] {
+                    Some(mm) => {
+                        let m = &mm[..];
+                        let (s0, e0) = chunk_lines(m, c);
+                        if e0 + 128 <= m.len() {
+                            if *K_POP {
+                                populate(m, s0, e0);
+                            }
+                            (m, s0, e0)
+                        } else {
+                            st.buf.clear();
+                            st.buf.extend_from_slice(&m[s0..e0]);
+                            st.buf.resize(e0 - s0 + 128, 0);
+                            (&st.buf[..], 0, e0 - s0)
+                        }
+                    }
+                    None => {
+                        let (f, len) = &files[c.file];
+                        let (s, e) = read_chunk(f, *len, c, &mut st.buf);
+                        (&st.buf[..], s, e)
+                    }
+                };
                 match c.kind {
                     Kind::Ev => {
                         let ev = &mut st.wc;
@@ -1676,7 +1694,7 @@ fn main() {
                                 }
                                 e.uid = unsafe { key_fast(uid) };
                             }
-                            ev.push(bucket(ek), e);
+                            ev.push(bucket_sh(ek, sha), e);
                         });
                     }
                     Kind::Ck => {
@@ -1692,7 +1710,7 @@ fn main() {
                             }
                             let Some(ci) = campaigns.get(camp) else { return };
                             let u = unsafe { key_fast(uid) };
-                            ck.push(bucket(u), Ck { person: u, cid: unsafe { key_fast(cid) }, ts: (t - cws) as u32, camp: ci });
+                            ck.push(bucket_sh(u, sha), Ck { person: u, cid: unsafe { key_fast(cid) }, ts: (t - cws) as u32, camp: ci });
                         });
                     }
                     Kind::Ln => {}
@@ -1732,14 +1750,14 @@ fn main() {
     }
     let ptab = &ptab;
     let border: Vec<usize> = {
-        let mut v: Vec<(usize, usize)> = (0..NB).map(|b| (sa.iter().map(|s| s.ev[b].len()).sum::<usize>(), b)).collect();
+        let mut v: Vec<(usize, usize)> = (0..nba).map(|b| (sa.iter().map(|s| s.ev[b].len()).sum::<usize>(), b)).collect();
         v.sort_unstable_by(|x, y| y.cmp(x));
         v.into_iter().map(|x| x.1).collect()
     };
     let mut sb = run(
         nt,
-        NB,
-        |tid| SB { tid, pur: Vec::with_capacity(est / nt / 20 + 64), tab: vec![], dead: vec![], wev: Wc::new(cap), wck: Wc::new(cap_ck), ev: vec![], ck: vec![] },
+        nba,
+        |tid| SB { tid, pur: Vec::with_capacity(est / nt / 20 + 64), tab: vec![], dead: vec![], wev: Wc::new(nbd, capd), wck: Wc::new(nbd, capd_ck), ev: vec![], ck: vec![] },
         |st, t| {
             let b = border[t];
             // virtual concatenation of every thread's bucket b
@@ -1814,7 +1832,7 @@ fn main() {
                         } else {
                             0
                         };
-                        st.wev.push(bucket(person), PEv { person, ts: e.ts, aux });
+                        st.wev.push(bucket_sh(person, shd), PEv { person, ts: e.ts, aux });
                     }
                     gi += 1;
                 }
@@ -1823,7 +1841,7 @@ fn main() {
                 for c in &s.ck[b] {
                     let mut c = *c;
                     c.person = ptab.get(c.person);
-                    st.wck.push(bucket(c.person), c);
+                    st.wck.push(bucket_sh(c.person, shd), c);
                 }
             }
         },
@@ -1859,7 +1877,7 @@ fn main() {
         camp: Vec<[i64; 4]>,
     }
     let dorder: Vec<usize> = {
-        let mut v: Vec<(usize, usize)> = (0..NB)
+        let mut v: Vec<(usize, usize)> = (0..nbd)
             .map(|b| (sc.iter().map(|s| s.ev[b].len() + s.ck[b].len()).sum::<usize>(), b))
             .collect();
         v.sort_unstable_by(|x, y| y.cmp(x));
@@ -1867,7 +1885,7 @@ fn main() {
     };
     let sd = run(
         nt,
-        NB,
+        nbd,
         |_| SD { ev: vec![], ck: vec![], evs: vec![], cks: vec![], k1: vec![], k2: vec![], map: FxHashMap::default(), li: vec![], cli: vec![], cnt: vec![], eoff: vec![], coff: vec![], users: Vec::with_capacity(est / nt / 8 + 64), camp: vec![[0; 4]; ncamp * ndays] },
         |st, t| {
             let b = dorder[t];
