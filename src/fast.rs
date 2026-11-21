@@ -7,6 +7,7 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+static K_MODE: LazyLock<u32> = LazyLock::new(|| knob("FAST_MODE", 0) as u32);
 pub(crate) const MASK40: u64 = (1 << 40) - 1;
 const A0: u64 = 0x9E37_79B9_7F4B;
 const A1: u64 = 0xD6E8_FEB8_6659;
@@ -71,6 +72,281 @@ unsafe fn b36(p: *const u8, k: usize) -> Option<u64> {
     if v > MASK40 { None } else { Some(v) }
 }
 
+
+// ---------- SSE field decoders ----------
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+#[repr(C, align(16))]
+struct A16([u8; 16]);
+/// per digit count k: pshufb mask right-aligning k bytes into lanes 0..8, and '0' padding
+const fn b36tab() -> [(A16, A16); 9] {
+    let mut t = [const { (A16([0; 16]), A16([0; 16])) }; 9];
+    let mut k = 0;
+    while k <= 8 {
+        let mut m = [0x80u8; 16];
+        let mut pad = [b'0'; 16];
+        let mut i = 0;
+        while i < 8 {
+            if i >= 8 - k {
+                m[i] = (i - (8 - k)) as u8;
+                pad[i] = 0;
+            }
+            i += 1;
+        }
+        t[k] = (A16(m), A16(pad));
+        k += 1;
+    }
+    t
+}
+static B36T: [(A16, A16); 9] = b36tab();
+
+/// Canonical base36 of k = 1..=8 chars at p (16 readable bytes); None if not canonical.
+#[inline(always)]
+unsafe fn b36v(p: *const u8, k: usize, tab: &[(A16, A16)]) -> Option<u64> {
+    unsafe {
+        if k.wrapping_sub(1) >= 8 {
+            return None;
+        }
+        let t = tab.get_unchecked(k);
+        let raw = _mm_loadu_si128(p as *const __m128i);
+        let x = _mm_or_si128(_mm_shuffle_epi8(raw, _mm_load_si128(t.0.0.as_ptr() as *const __m128i)), _mm_load_si128(t.1.0.as_ptr() as *const __m128i));
+        let ge0 = _mm_cmpgt_epi8(x, _mm_set1_epi8(0x2F));
+        let le9 = _mm_cmplt_epi8(x, _mm_set1_epi8(0x3A));
+        let gea = _mm_cmpgt_epi8(x, _mm_set1_epi8(0x60));
+        let lez = _mm_cmplt_epi8(x, _mm_set1_epi8(0x7B));
+        let ok = _mm_or_si128(_mm_and_si128(ge0, le9), _mm_and_si128(gea, lez));
+        if _mm_movemask_epi8(ok) != 0xFFFF || (k > 1 && *p == b'0') {
+            return None;
+        }
+        let d = _mm_sub_epi8(_mm_sub_epi8(x, _mm_set1_epi8(0x30)), _mm_and_si128(gea, _mm_set1_epi8(39)));
+        let a = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0124)); // bytes [36, 1]
+        let b = _mm_madd_epi16(a, _mm_set1_epi32(0x0001_0510)); // words [1296, 1]
+        let q = _mm_cvtsi128_si64(b) as u64;
+        let v = (q & 0xFFFF_FFFF) * 1_679_616 + (q >> 32);
+        if v > MASK40 { None } else { Some(v) }
+    }
+}
+
+/// scrambled value of an ID "<prefix><base36>" of total length n at p
+#[inline(always)]
+unsafe fn raw_idv(p: *const u8, n: usize, prefix: u8, tab: &[(A16, A16)]) -> Option<u64> {
+    unsafe {
+        if n >= 2 && n <= 9 && *p == prefix {
+            b36v(p.add(1), n - 1, tab)
+        } else {
+            None
+        }
+    }
+}
+
+/// Months that an F1 timestamp may fall in: ("YYYY-MM-" as LE u64, first ms of month, days in month)
+pub(crate) struct MonTab {
+    m: [(u64, i64, i64); 4],
+    n: usize,
+    complete: bool,
+}
+impl MonTab {
+    fn new(from: i64, to: i64) -> MonTab {
+        // every month intersecting [from, to]
+        let mut t = MonTab { m: [(u64::MAX, 0, 0); 4], n: 0, complete: false };
+        let civil = |ms: i64| -> (i64, i64) {
+            // (year, month) of a UTC ms
+            let days = ms.div_euclid(DAY);
+            let mut y = 1970 + days / 366;
+            while days_from_civil(y + 1, 1, 1) <= days {
+                y += 1;
+            }
+            while days_from_civil(y, 1, 1) > days {
+                y -= 1;
+            }
+            let mut mo = 1;
+            while mo < 12 && days_from_civil(y, mo + 1, 1) <= days {
+                mo += 1;
+            }
+            (y, mo)
+        };
+        let (mut y, mut mo) = civil(from);
+        let (y1, mo1) = civil(to);
+        while (y, mo) <= (y1, mo1) && t.n < 2 {
+            let s = format!("{:04}-{:02}-", y, mo);
+            let pat = u64::from_le_bytes(s.as_bytes().try_into().unwrap());
+            let start = days_from_civil(y, mo, 1) * DAY;
+            let (ny, nm) = if mo == 12 { (y + 1, 1) } else { (y, mo + 1) };
+            let dim = days_from_civil(ny, nm, 1) - days_from_civil(y, mo, 1);
+            t.m[t.n] = (pat, start, dim);
+            t.n += 1;
+            y = ny;
+            mo = nm;
+        }
+        t.complete = (y, mo) > (y1, mo1);
+        if y < 1 || y > 9999 {
+            t.n = 0;
+            t.complete = false;
+        }
+        t
+    }
+}
+
+/// F1 "YYYY-MM-DDTHH:MM:SSZ" (20 bytes at p) whose month is in the table; None otherwise.
+#[inline(always)]
+unsafe fn f1_tab(p: *const u8, t: &MonTab) -> Option<i64> {
+    unsafe {
+        let v0 = std::ptr::read_unaligned(p as *const u64);
+        // at most two months per table (checked at construction)
+        let (base, dim) = if v0 == t.m[0].0 {
+            (t.m[0].1, t.m[0].2)
+        } else if v0 == t.m[1].0 {
+            (t.m[1].1, t.m[1].2)
+        } else {
+            return None;
+        };
+        let v1 = std::ptr::read_unaligned(p.add(8) as *const u64); // DDTHH:MM
+        let v2 = std::ptr::read_unaligned(p.add(16) as *const u32) as u64; // :SSZ
+        const DM1: u64 = 0xFFFF_00FF_FF00_FFFF;
+        let d1 = (v1 & DM1).wrapping_sub(0x3030_0030_3000_3030);
+        let d2v = (v2 & 0x00FF_FF00).wrapping_sub(0x0030_3000);
+        let bad = ((d1.wrapping_add(0x7676_7676_7676_7676) | d1 | d2v.wrapping_add(0x0076_7600) | d2v) & HI8)
+            | ((v1 & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_0054_0000)
+            | ((v2 & 0xFF00_00FF) ^ 0x5A00_003A);
+        // pairs: byte 0 = DD, byte 3 = HH, byte 6 = MM; byte 1 of p2 = SS
+        let p1 = d1.wrapping_mul(10).wrapping_add(d1 >> 8);
+        let p2 = d2v.wrapping_mul(10).wrapping_add(d2v >> 8);
+        let dd = p1 & 0xFF;
+        let hh = (p1 >> 24) & 0xFF;
+        let mi = (p1 >> 48) & 0xFF;
+        let ss = (p2 >> 8) & 0xFF;
+        // range checks without branches: x > lim  <=>  (lim - x) borrows
+        let over = (dim as u64).wrapping_sub(dd) | 23u64.wrapping_sub(hh) | 59u64.wrapping_sub(mi) | 59u64.wrapping_sub(ss) | dd.wrapping_sub(1);
+        if (bad | (over & (1 << 63))) != 0 {
+            return None;
+        }
+        Some(base + ((dd as i64 - 1) * 86_400 + hh as i64 * 3600 + mi as i64 * 60 + ss as i64) * 1000)
+    }
+}
+
+/// F2 "YYYY-MM-DDTHH:MM:SS+HH:MM" (25 bytes at p) whose local month is in the table; None otherwise.
+#[inline(always)]
+unsafe fn f2_tab(p: *const u8, t: &MonTab) -> Option<i64> {
+    unsafe {
+        let v0 = std::ptr::read_unaligned(p as *const u64);
+        let (base, dim) = if v0 == t.m[0].0 {
+            (t.m[0].1, t.m[0].2)
+        } else if v0 == t.m[1].0 {
+            (t.m[1].1, t.m[1].2)
+        } else {
+            return None;
+        };
+        let v1 = std::ptr::read_unaligned(p.add(8) as *const u64); // DDTHH:MM
+        let v2 = std::ptr::read_unaligned(p.add(16) as *const u64); // :SS+HH:M
+        let c24 = (*p.add(24)).wrapping_sub(b'0') as u64;
+        const DM1: u64 = 0xFFFF_00FF_FF00_FFFF;
+        let d1 = (v1 & DM1).wrapping_sub(0x3030_0030_3000_3030);
+        // v2 bytes: 0 ':' 1 S 2 S 3 sign 4 H 5 H 6 ':' 7 M
+        let d2v = (v2 & 0xFF00_FFFF_00FF_FF00).wrapping_sub(0x3000_3030_0030_3000);
+        let bad = ((d1.wrapping_add(0x7676_7676_7676_7676) | d1 | d2v.wrapping_add(0x7600_7676_0076_7600) | d2v) & HI8)
+            | ((v1 & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_0054_0000)
+            | ((v2 & 0x00FF_0000_0000_00FF) ^ 0x003A_0000_0000_003A)
+            | (c24 > 9) as u64;
+        let sign = (v2 >> 24) & 0xFF;
+        let p1 = d1.wrapping_mul(10).wrapping_add(d1 >> 8);
+        let p2 = d2v.wrapping_mul(10).wrapping_add(d2v >> 8);
+        let dd = p1 & 0xFF;
+        let hh = (p1 >> 24) & 0xFF;
+        let mi = (p1 >> 48) & 0xFF;
+        let ss = (p2 >> 8) & 0xFF;
+        let oh = (p2 >> 32) & 0xFF;
+        let om = ((p2 >> 56) & 0xFF) + c24;
+        let over = (dim as u64).wrapping_sub(dd) | 23u64.wrapping_sub(hh) | 59u64.wrapping_sub(mi) | 59u64.wrapping_sub(ss) | dd.wrapping_sub(1)
+            | 23u64.wrapping_sub(oh) | 59u64.wrapping_sub(om);
+        if (bad | (over & (1 << 63))) != 0 || (sign != b'+' as u64 && sign != b'-' as u64) {
+            return None;
+        }
+        let off = (oh * 60 + om) as i64 * 60_000;
+        let local = base + ((dd as i64 - 1) * 86_400 + hh as i64 * 3600 + mi as i64 * 60 + ss as i64) * 1000;
+        Some(if sign == b'+' as u64 { local - off } else { local + off })
+    }
+}
+
+/// ingest_ts is always valid F1 (rules.md): seconds since `ws` for a table month, decoded without
+/// validation like the general path; None for anything else (the caller falls back).
+#[inline(always)]
+unsafe fn ingest_tab(p: *const u8, t: &MonTab, ws: i64) -> Option<i64> {
+    unsafe {
+        let v0 = std::ptr::read_unaligned(p as *const u64);
+        let base = if v0 == t.m[0].0 {
+            t.m[0].1
+        } else if v0 == t.m[1].0 {
+            t.m[1].1
+        } else {
+            return None;
+        };
+        let v1 = std::ptr::read_unaligned(p.add(8) as *const u64);
+        let v2 = std::ptr::read_unaligned(p.add(16) as *const u32) as u64;
+        let d1 = (v1 & 0xFFFF_00FF_FF00_FFFF).wrapping_sub(0x3030_0030_3000_3030);
+        let d2v = (v2 & 0x00FF_FF00).wrapping_sub(0x0030_3000);
+        let p1 = d1.wrapping_mul(10).wrapping_add(d1 >> 8);
+        let p2 = d2v.wrapping_mul(10).wrapping_add(d2v >> 8);
+        let secs = ((p1 & 0xFF) as i64 - 1) * 86_400 + ((p1 >> 24) & 0xFF) as i64 * 3600 + ((p1 >> 48) & 0xFF) as i64 * 60 + ((p2 >> 8) & 0xFF) as i64;
+        Some((base - ws) / 1000 + secs)
+    }
+}
+
+/// 13 ASCII digits at p (16 readable bytes) -> value
+#[inline(always)]
+unsafe fn digits13(p: *const u8) -> Option<i64> {
+    unsafe {
+        let raw = _mm_loadu_si128(p as *const __m128i);
+        // right-align 13 digits into 16 lanes: lanes 0..3 = '0'
+        let sh = _mm_slli_si128(raw, 3);
+        let x = _mm_or_si128(sh, _mm_setr_epi8(0x30, 0x30, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+        let d = _mm_sub_epi8(x, _mm_set1_epi8(0x30));
+        // unsigned d <= 9 for all lanes
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 0xFFFF {
+            return None;
+        }
+        let a = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A)); // [10, 1]
+        let b = _mm_madd_epi16(a, _mm_set1_epi32(0x0001_0064)); // [100, 1]
+        let c = _mm_packus_epi32(b, b);
+        let e = _mm_madd_epi16(c, _mm_set1_epi32(0x0001_2710)); // [10000, 1]
+        let q = _mm_cvtsi128_si64(e) as u64;
+        Some(((q & 0xFFFF_FFFF) * 100_000_000 + (q >> 32)) as i64)
+    }
+}
+
+/// Event/click ts: F1 and F2 whose (local) month is in the tables and 13-digit F3 decoded inline,
+/// anything else through the general parser. `win` holds every month of the valid range and `loc`
+/// every month within a day of it, so a missing month means outside the window (None is correct).
+#[inline(always)]
+unsafe fn ts_win(b: &[u8], win: &MonTab, loc: &MonTab) -> Option<i64> {
+    unsafe {
+        let n = b.len();
+        let p = b.as_ptr();
+        if n == 20 && *p.add(4) == b'-' {
+            return f1_tab(p, win);
+        }
+        if n == 13 {
+            return digits13(p);
+        }
+        let _ = loc;
+        parse_ts_fast(b)
+    }
+}
+
+/// ingest_ts as seconds since ws (i32 range clamp like the general path); unparseable -> i32::MAX
+#[inline(always)]
+unsafe fn ingest_win(b: &[u8], tab: &MonTab, ws: i64) -> i64 {
+    unsafe {
+        if b.len() == 20 {
+            if let Some(v) = ingest_tab(b.as_ptr(), tab, ws) {
+                return v;
+            }
+        }
+        let ms = parse_ingest(b).unwrap_or(i64::MAX);
+        (ms.saturating_sub(ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64)
+    }
+}
+
 /// Scrambled value of a canonical ID with the given one-letter prefix (8 readable bytes past s[1]).
 #[inline(always)]
 unsafe fn raw_id(s: &[u8], prefix: u8) -> Option<u64> {
@@ -126,7 +402,7 @@ fn special_key(idx: u32) -> u64 {
 /// uid -> uid number (< 2^31) or SPECIAL | index
 #[inline(always)]
 unsafe fn dec_uid(s: &[u8], ukey: u64) -> u32 {
-    if let Some(x) = unsafe { raw_id(s, b'u') } {
+    if let Some(x) = unsafe { raw_idv(s.as_ptr(), s.len(), b'u', &B36T) } {
         let v = unscr(x, ukey);
         if v < (1 << 31) {
             return v as u32;
@@ -716,6 +992,15 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     if we - cws >= (1i64 << 31) || we <= ws {
         return Err("window".into());
     }
+    let evwin = MonTab::new(ws, we - 1);
+    let ckwin = MonTab::new(cws, we - 1);
+    let evloc = MonTab::new(ws - DAY, we + DAY);
+    let ckloc = MonTab::new(cws - DAY, we + DAY);
+    let ingtab = MonTab::new(ws - DAY, we + 6 * DAY);
+    if !evwin.complete || !ckwin.complete || !evloc.complete || !ckloc.complete {
+        return Err("months".into());
+    }
+    let (evwin, ckwin, ingtab, evloc, ckloc) = (&evwin, &ckwin, &ingtab, &evloc, &ckloc);
     {
         let dd = cws.div_euclid(DAY);
         let mut y = 1970i64;
@@ -961,12 +1246,26 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                         let purs = &mut st.purs;
                         let sparse = &mut st.sparse;
                         let maxp = &mut st.maxp;
+                        let mode = *K_MODE;
+                        if mode == 9 {
+                            return;
+                        }
                         for_rows_fast::<7>(b, s, e, #[inline(always)] |[eid, uid, ts, ing, et, pid, price]| {
                             if eid.is_empty() {
                                 return;
                             }
-                            let ingest_ms = unsafe { parse_ingest(ing) }.unwrap_or(i64::MAX);
-                            let ingest = (ingest_ms.saturating_sub(ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                            if mode != 0 {
+                                use std::hint::black_box as bb;
+                                if mode == 1 { bb(eid.len() + uid.len() + ts.len() + ing.len() + et.len() + pid.len() + price.len()); return; }
+                                if mode >= 2 { bb(unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) }.map(|x| unscr(x, ekey))); }
+                                if mode >= 3 { bb(unsafe { dec_uid(uid, ukey) }); }
+                                if mode >= 4 { bb(unsafe { ts_win(ts, evwin, evloc) }); }
+                                if mode >= 5 { bb(unsafe { ingest_win(ing, ingtab, ws) }); }
+                                if mode >= 6 { bb(unsafe { key_fast(eid) }); bb(unsafe { key_fast(uid) }); }
+                                return;
+                            }
+                            let ingest_s = unsafe { ingest_win(ing, ingtab, ws) };
+                            let ingest = ingest_s as i32;
                             let mut typ = 3u32;
                             let mut tsr = 0u32;
                             let mut pr = 0u32;
@@ -975,8 +1274,9 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                                 if uid.is_empty() || pid.is_empty() {
                                     break 'v;
                                 }
-                                let Some(t) = (unsafe { parse_ts_fast(ts) }) else { break 'v };
-                                if t < ws || t >= we || ingest_ms.saturating_sub(t) > DAY {
+                                let Some(t) = (unsafe { ts_win(ts, evwin, evloc) }) else { break 'v };
+                                // late: ingest - ts > 24 h (an unparseable ingest counts as late)
+                                if t < ws || t >= we || ingest_s == i32::MAX as i64 || (ingest_s * 1000 + ws) - t > DAY {
                                     break 'v;
                                 }
                                 let ty = match et.len() {
@@ -1010,7 +1310,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                                 typ = ty;
                             }
                             let u = if typ != 3 { unsafe { dec_uid(uid, ukey) } } else { 0 };
-                            let v = match unsafe { raw_id(eid, b'e') } {
+                            let v = match unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) } {
                                 Some(x) => unscr(x, ekey),
                                 None => u64::MAX,
                             };
@@ -1037,7 +1337,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                             if cid.is_empty() || uid.is_empty() {
                                 return;
                             }
-                            let Some(t) = (unsafe { parse_ts_fast(ts) }) else { return };
+                            let Some(t) = (unsafe { ts_win(ts, ckwin, ckloc) }) else { return };
                             if t < cws || t >= we {
                                 return;
                             }
@@ -1446,4 +1746,185 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     });
     log("done");
     Ok(())
+}
+
+
+/// micro-benchmark of the field decoders (FAST_BENCH=<n>), run under callgrind
+pub(crate) fn bench(which: u32, data: &Path) {
+    let manifest = String::from_utf8_lossy(&read_small(&data.join("manifest.json"))).to_string();
+    let ws = manifest_time(&manifest, "window_start");
+    let we = manifest_time(&manifest, "window_end");
+    {
+        let dd = (ws - WEEK).div_euclid(DAY);
+        let mut y = 1970i64;
+        while days_from_civil(y + 1, 1, 1) <= dd { y += 1; }
+        while days_from_civil(y, 1, 1) > dd { y -= 1; }
+        let _ = YT.set(year_tab(y - 1));
+    }
+    let evwin = MonTab::new(ws, we - 1);
+    let evloc = MonTab::new(ws - DAY, we + DAY);
+    let ingtab = MonTab::new(ws - DAY, we + 6 * DAY);
+    let mut buf: Vec<u8> = vec![];
+    for p in list_csv(&data.join("events")) {
+        let b = std::fs::read(&p).unwrap();
+        if let Some(h) = memchr(b'\n', &b) { buf.extend_from_slice(&b[h + 1..]); }
+    }
+    let n0 = buf.len();
+    buf.resize(n0 + 256, 0);
+    let mut rows: Vec<[(u32, u32); 7]> = vec![];
+    for_rows_fast::<7>(&buf, 0, n0, |a| {
+        let mut r = [(0u32, 0u32); 7];
+        for k in 0..7 { r[k] = ((a[k].as_ptr() as usize - buf.as_ptr() as usize) as u32, a[k].len() as u32); }
+        rows.push(r);
+    });
+    let f = |r: &[(u32, u32); 7], k: usize| -> &[u8] { &buf[r[k].0 as usize..(r[k].0 + r[k].1) as usize] };
+    let t0 = std::time::Instant::now();
+    let mut acc = 0u64;
+    for _ in 0..3 {
+        for r in &rows {
+            let x = match which {
+                1 => unsafe { raw_idv(f(r, 0).as_ptr(), r[0].1 as usize, b'e', &B36T) }.map(|x| unscr(x, 77)).unwrap_or(0),
+                2 => unsafe { raw_id(f(r, 0), b'e') }.map(|x| unscr(x, 77)).unwrap_or(0),
+                3 => unsafe { key_fast(f(r, 0)) },
+                4 => (unsafe { ts_win(f(r, 2), &evwin, &evloc) }).unwrap_or(0) as u64,
+                5 => (unsafe { parse_ts_fast(f(r, 2)) }).unwrap_or(0) as u64,
+                6 => (unsafe { ingest_win(f(r, 3), &ingtab, ws) }) as u64,
+                7 => (unsafe { parse_ingest(f(r, 3)) }).unwrap_or(0) as u64,
+                8 => (unsafe { dec_uid(f(r, 1), 77) }) as u64,
+                10 => { let t = f(r, 2); if t.len() == 20 { (unsafe { f1_tab(t.as_ptr(), &evwin) }).unwrap_or(0) as u64 } else { 0 } }
+                11 => { let t = f(r, 2); if t.len() == 20 { 1 } else { 0 } }
+                14 => { let t = f(r, 2); if t.len() == 20 { probe_f1(t.as_ptr(), &evwin).unwrap_or(0) as u64 } else { 0 } }
+                15 => probe_b36v(f(r, 0).as_ptr(), 7).unwrap_or(0),
+                12 => { let t = f(r, 2); if t.len() == 13 { (unsafe { digits13(t.as_ptr()) }).unwrap_or(0) as u64 } else { 0 } }
+                13 => { let t = f(r, 2); if t.len() == 25 { (unsafe { parse_ts_fast(t) }).unwrap_or(0) as u64 } else { 0 } }
+                16 => { let t = f(r, 2); if t.len() == 25 { (unsafe { f2_tab(t.as_ptr(), &evloc) }).unwrap_or(0) as u64 } else { 0 } }
+                17 => { let t = f(r, 2); if t.len() == 25 { let a = unsafe { f2_tab(t.as_ptr(), &evloc) }; let b = unsafe { parse_ts_fast(t) }; let ok = match (a, b) { (Some(x), Some(y)) => x == y, (None, None) => true, (None, Some(y)) => y < ws - DAY || y >= we + DAY, _ => false }; if !ok { eprintln!("F2 MISMATCH {:?} {:?} {:?}", String::from_utf8_lossy(t), a, b); } 0 } else { 0 } }
+                _ => r[0].1 as u64,
+            };
+            acc = acc.wrapping_add(std::hint::black_box(x));
+        }
+    }
+    eprintln!("bench {which}: rows {} acc {acc} {:?}", rows.len(), t0.elapsed());
+}
+
+#[inline(never)]
+pub(crate) fn probe_b36v(p: *const u8, k: usize) -> Option<u64> {
+    unsafe { b36v(p, k, &B36T) }
+}
+#[inline(never)]
+pub(crate) fn probe_f1(p: *const u8, t: &MonTab) -> Option<i64> {
+    unsafe { f1_tab(p, t) }
+}
+pub(crate) fn probe_f1_call(p: *const u8) {
+    let t = std::hint::black_box(MonTab::new(1_800_000_000_000, 1_801_000_000_000));
+    eprintln!("{:?}", probe_f1(p, &t));
+}
+
+/// FAST_FUZZ: the inline decoders against the general ones
+pub(crate) fn fuzz_fast() {
+    let mut rng: u64 = 0x1234_5678_9abc_def1;
+    let mut next = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+    let mut bad = 0u64;
+    // windows across years incl. leap Feb and year ends
+    let starts = ["2025-01-01T00:00:00Z", "2027-12-20T00:00:00Z", "2028-02-20T00:00:00Z", "2028-12-25T00:00:00Z", "2026-06-24T00:00:00Z"];
+    for st in starts {
+        let ws = parse_ts(st.as_bytes()).unwrap();
+        let we = ws + 14 * DAY;
+        {
+            let dd = (ws - WEEK).div_euclid(DAY);
+            let mut y = 1970i64;
+            while days_from_civil(y + 1, 1, 1) <= dd { y += 1; }
+            while days_from_civil(y, 1, 1) > dd { y -= 1; }
+            // YT is set once per process; only the first window uses the fast table path in parse_ts_fast
+            let _ = YT.set(year_tab(y - 1));
+        }
+        let win = MonTab::new(ws, we - 1);
+        let loc = MonTab::new(ws - DAY, we + DAY);
+        let ing = MonTab::new(ws - DAY, we + 6 * DAY);
+        for _ in 0..400_000 {
+            let t = ws - 3 * DAY + (next() % (20 * DAY as u64)) as i64;
+            let t = t - t.rem_euclid(1000) + if next() % 3 == 0 { (next() % 1000) as i64 } else { 0 };
+            let days = t.div_euclid(DAY);
+            let msd = t.rem_euclid(DAY);
+            // civil from days
+            let mut y = 1970 + days / 366;
+            while days_from_civil(y + 1, 1, 1) <= days { y += 1; }
+            while days_from_civil(y, 1, 1) > days { y -= 1; }
+            let mut mo = 1;
+            while mo < 12 && days_from_civil(y, mo + 1, 1) <= days { mo += 1; }
+            let d = days - days_from_civil(y, mo, 1) + 1;
+            let (h, mi, s) = (msd / 3_600_000, msd / 60_000 % 60, msd / 1000 % 60);
+            let mut b: Vec<u8> = match next() % 3 {
+                0 => format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z").into_bytes(),
+                1 => format!("{}", t).into_bytes(),
+                _ => {
+                    let oh = (next() % 24) as i64;
+                    let om = (next() % 60) as i64;
+                    let sign = if next() % 2 == 0 { 1 } else { -1 };
+                    let lt = t + sign * (oh * 60 + om) * 60_000;
+                    let ldays = lt.div_euclid(DAY);
+                    let lms = lt.rem_euclid(DAY);
+                    let mut y = 1970 + ldays / 366;
+                    while days_from_civil(y + 1, 1, 1) <= ldays { y += 1; }
+                    while days_from_civil(y, 1, 1) > ldays { y -= 1; }
+                    let mut mo = 1;
+                    while mo < 12 && days_from_civil(y, mo + 1, 1) <= ldays { mo += 1; }
+                    let d = ldays - days_from_civil(y, mo, 1) + 1;
+                    format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}{}{oh:02}:{om:02}", lms / 3_600_000, lms / 60_000 % 60, lms / 1000 % 60, if sign > 0 { '+' } else { '-' }).into_bytes()
+                }
+            };
+            // corruptions
+            match next() % 8 {
+                0 => { let i = (next() as usize) % b.len(); b[i] = (next() % 128) as u8; }
+                1 => { let i = (next() as usize) % b.len(); b[i] = b"0123456789:-TZ+"[(next() % 15) as usize]; }
+                2 => { if b.len() == 20 { b[8] = b'3'; b[9] = b'0' + (next() % 3) as u8; } }
+                3 => { if b.len() == 20 { b[11] = b'2'; b[12] = b'0' + (next() % 6) as u8; } }
+                _ => {}
+            }
+            let mut pad = b.clone();
+            pad.resize(b.len() + 64, b'7');
+            let s = &pad[..b.len()];
+            let r = unsafe { parse_ts_fast(s) };
+            let f = unsafe { ts_win(s, &win, &loc) };
+            let rin = r.filter(|&x| x >= ws && x < we);
+            let fin = f.filter(|&x| x >= ws && x < we);
+            if rin != fin {
+                bad += 1;
+                if bad < 10 { eprintln!("TS MISMATCH {:?} ref {:?} fast {:?}", String::from_utf8_lossy(s), r, f); }
+            }
+            if b.len() == 20 && r.is_some() && b[19] == b'Z' {
+                let gi = unsafe { ingest_win(s, &ing, ws) };
+                let ri = (r.unwrap().saturating_sub(ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64);
+                if gi != ri {
+                    bad += 1;
+                    if bad < 10 { eprintln!("INGEST MISMATCH {:?} ref {} fast {}", String::from_utf8_lossy(s), ri, gi); }
+                }
+            }
+        }
+    }
+    // base36
+    let digs = b"0123456789abcdefghijklmnopqrstuvwxyzA_ -";
+    for _ in 0..3_000_000 {
+        let k = 1 + (next() % 10) as usize;
+        let mut b: Vec<u8> = (0..k).map(|_| digs[(next() % if next() % 10 == 0 { 40 } else { 36 }) as usize]).collect();
+        let mut pad = b.clone();
+        pad.resize(k + 32, b'9');
+        let f = unsafe { b36v(pad.as_ptr(), k, &B36T) };
+        let r = (|| {
+            if k > 8 || (k > 1 && b[0] == b'0') { return None; }
+            let mut v: u64 = 0;
+            for &c in &b {
+                let d = match c { b'0'..=b'9' => c - b'0', b'a'..=b'z' => c - b'a' + 10, _ => return None } as u64;
+                v = v * 36 + d;
+            }
+            if v > MASK40 { None } else { Some(v) }
+        })();
+        let s = unsafe { b36(pad.as_ptr(), k) };
+        if f != r || s != r {
+            bad += 1;
+            if bad < 20 { eprintln!("B36 MISMATCH {:?} ref {:?} sse {:?} swar {:?}", String::from_utf8_lossy(&b), r, f, s); }
+        }
+        b.clear();
+    }
+    eprintln!("fuzz_fast done, mismatches: {bad}");
 }

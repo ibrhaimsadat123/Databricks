@@ -962,6 +962,161 @@ fn for_rows_fast<const N: usize>(buf: &[u8], s: usize, e: usize, mut g: impl FnM
     }
 }
 
+/// masks over 128 bytes: separators (',' or '\n'), newlines, quotes
+#[inline(always)]
+fn masks128s(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let vc = _mm256_set1_epi8(b',' as i8);
+        let vn = _mm256_set1_epi8(b'\n' as i8);
+        let vq = _mm256_set1_epi8(b'"' as i8);
+        let a0 = _mm256_loadu_si256(p as *const __m256i);
+        let a1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let a2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
+        let a3 = _mm256_loadu_si256(p.add(96) as *const __m256i);
+        let n0 = _mm256_cmpeq_epi8(a0, vn);
+        let n1 = _mm256_cmpeq_epi8(a1, vn);
+        let n2 = _mm256_cmpeq_epi8(a2, vn);
+        let n3 = _mm256_cmpeq_epi8(a3, vn);
+        let s0 = _mm256_or_si256(_mm256_cmpeq_epi8(a0, vc), n0);
+        let s1 = _mm256_or_si256(_mm256_cmpeq_epi8(a1, vc), n1);
+        let s2 = _mm256_or_si256(_mm256_cmpeq_epi8(a2, vc), n2);
+        let s3 = _mm256_or_si256(_mm256_cmpeq_epi8(a3, vc), n3);
+        let mm = |v: __m256i| _mm256_movemask_epi8(v) as u32 as u64;
+        let sep = [mm(s0) | (mm(s1) << 32), mm(s2) | (mm(s3) << 32)];
+        let nl = [mm(n0) | (mm(n1) << 32), mm(n2) | (mm(n3) << 32)];
+        let q = [mm(_mm256_cmpeq_epi8(a0, vq)) | (mm(_mm256_cmpeq_epi8(a1, vq)) << 32), mm(_mm256_cmpeq_epi8(a2, vq)) | (mm(_mm256_cmpeq_epi8(a3, vq)) << 32)];
+        return (sep, nl, q);
+    }
+    #[allow(unreachable_code)]
+    {
+        let s = unsafe { std::slice::from_raw_parts(p, 128) };
+        let (c, n, q) = masks128(s);
+        ([c[0] | n[0], c[1] | n[1]], n, q)
+    }
+}
+
+/// Same contract as for_rows_fast (identical results), leaner per-line work.
+#[inline(always)]
+fn for_rows_fast2<const N: usize>(buf: &[u8], s: usize, e: usize, mut g: impl FnMut([&[u8]; N])) {
+    assert!(buf.len() >= e + 128);
+    let base = buf.as_ptr();
+    let mut ls = s;
+    let mut f = [(0usize, 0usize); N];
+    while ls < e {
+        let lp = unsafe { base.add(ls) };
+        let (mut sep, mut nl, mut q) = masks128s(lp);
+        let lim = e - ls;
+        if lim < 128 {
+            let v0 = low_mask(lim);
+            let v1 = if lim > 64 { low_mask(lim - 64) } else { 0 };
+            sep[0] &= v0;
+            sep[1] &= v1;
+            nl[0] &= v0;
+            nl[1] &= v1;
+            q[0] &= v0;
+            q[1] &= v1;
+        }
+        let le_off = if nl[0] != 0 {
+            nl[0].trailing_zeros() as usize
+        } else if nl[1] != 0 {
+            64 + nl[1].trailing_zeros() as usize
+        } else if lim <= 128 {
+            lim
+        } else {
+            let (ni, ok) = next_line::<N>(&buf[..e], ls, &mut f);
+            if ok {
+                let mut a: [&[u8]; N] = [&[]; N];
+                for k in 0..N {
+                    a[k] = &buf[f[k].0..f[k].1];
+                }
+                g(a);
+            }
+            ls = ni;
+            continue;
+        };
+        // separators strictly before the line end are commas
+        let m0 = low_mask(le_off);
+        let m1 = if le_off > 64 { low_mask(le_off - 64) } else { 0 };
+        let c0 = sep[0] & m0;
+        let c1 = sep[1] & m1;
+        if (c0.count_ones() + c1.count_ones()) as usize == N - 1 {
+            let mut ends = [0usize; N];
+            let mut k = 0;
+            let mut w = c0;
+            while w != 0 {
+                ends[k] = w.trailing_zeros() as usize;
+                w &= w - 1;
+                k += 1;
+            }
+            let mut w = c1;
+            while w != 0 {
+                ends[k] = 64 + w.trailing_zeros() as usize;
+                w &= w - 1;
+                k += 1;
+            }
+            ends[N - 1] = le_off;
+            let q0 = q[0] & m0;
+            let q1 = q[1] & m1;
+            let mut a: [&[u8]; N] = [&[]; N];
+            if (q0 | q1) == 0 {
+                let mut fs = 0usize;
+                for k in 0..N {
+                    let fe = ends[k];
+                    a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs), fe - fs) };
+                    fs = fe + 1;
+                }
+                g(a);
+            } else if le_off < 127 {
+                let nq = q0.count_ones() + q1.count_ones();
+                let sm = [(c0 << 1) | 1, (c1 << 1) | (c0 >> 63)]; // field starts
+                let em = {
+                    let mut x = [c0, c1];
+                    x[le_off >> 6] |= 1u64 << (le_off & 63);
+                    x
+                };
+                let last = [(em[0] >> 1) | (em[1] << 63), em[1] >> 1]; // last char of each field
+                let qs = [q0 & sm[0], q1 & sm[1]];
+                let ql = [q0 & last[0], q1 & last[1]];
+                let qe = [(q0 << 1) & em[0], ((q1 << 1) | (q0 >> 63)) & em[1]];
+                let fsb = pext64(qs[0], sm[0]) | (pext64(qs[1], sm[1]) << sm[0].count_ones());
+                let feb = pext64(qe[0], em[0]) | (pext64(qe[1], em[1]) << em[0].count_ones());
+                let ok = (qs[0] | ql[0]) == q0 && (qs[1] | ql[1]) == q1 && fsb == feb && nq == 2 * fsb.count_ones();
+                if ok {
+                    let mut fs = 0usize;
+                    for k in 0..N {
+                        let fe = ends[k];
+                        let qf = ((fsb >> k) & 1) as usize;
+                        a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + qf), fe - fs - 2 * qf) };
+                        fs = fe + 1;
+                    }
+                    g(a);
+                }
+            } else {
+                let nq = q0.count_ones() + q1.count_ones();
+                let mut fs = 0usize;
+                let mut cand = 0u32;
+                for k in 0..N {
+                    let fe = ends[k];
+                    let len = fe - fs;
+                    let qa = unsafe { *lp.add(fs) } == b'"';
+                    let last = if fe > fs { fe - 1 } else { fs };
+                    let qb = unsafe { *lp.add(last) } == b'"';
+                    let qf = (qa & qb & (len >= 2)) as usize;
+                    cand += qf as u32;
+                    a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + qf), len - 2 * qf) };
+                    fs = fe + 1;
+                }
+                if nq == 2 * cand {
+                    g(a);
+                }
+            }
+        }
+        ls += le_off + 1;
+    }
+}
+
 // ---------- files ----------
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -1351,7 +1506,7 @@ fn fuzz_rows() {
         let mut buf = chunk.clone();
         for _ in 0..128 { buf.push((next() & 0xff) as u8); }
         let mut fast: Vec<Vec<Vec<u8>>> = vec![];
-        for_rows_fast::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect()));
+        if std::env::var("FUZZ2").is_ok() { for_rows_fast2::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())); } else { for_rows_fast::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())); }
         let mut slow: Vec<Vec<Vec<u8>>> = vec![];
         let mut f = [(0usize, 0usize); 7];
         let mut i = 0;
@@ -1388,6 +1543,11 @@ fn main() {
         }
     }
     if std::env::var("FUZZ").is_ok() { fuzz(); return; }
+    if std::env::var("FAST_FUZZ").is_ok() { fast::fuzz_fast(); return; }
+    if let Ok(w) = std::env::var("FAST_BENCH") {
+        fast::bench(w.parse().unwrap_or(0), &PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into())));
+        return;
+    }
     let t0 = std::time::Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
