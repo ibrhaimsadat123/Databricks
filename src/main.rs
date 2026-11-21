@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::sync::{LazyLock, Mutex};
 
+mod fast;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -1200,6 +1202,11 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
         assert!(std::mem::size_of::<T>() * K == 64 && std::mem::align_of::<T>() >= 16);
         Wc { out: buckets_n(nb, cap), st: vec![[T::default(); K]; nb], n: vec![0; nb] }
     }
+    /// only the first `used` buckets get the capacity up front
+    fn new_n(nb: usize, cap: usize, used: usize) -> Self {
+        assert!(std::mem::size_of::<T>() * K == 64 && std::mem::align_of::<T>() >= 16);
+        Wc { out: (0..nb).map(|i| Vec::with_capacity(if i < used { cap } else { 0 })).collect(), st: vec![[T::default(); K]; nb], n: vec![0; nb] }
+    }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
         unsafe {
@@ -1403,6 +1410,14 @@ fn main() {
         }
     };
 
+    match fast::fast_main(&data, &outdir, nt, &log) {
+        Ok(()) => std::process::exit(0),
+        Err(why) => {
+            if verbose {
+                eprintln!("fast path declined: {why}");
+            }
+        }
+    }
     let manifest = String::from_utf8_lossy(&read_small(&data.join("manifest.json"))).to_string();
     let ws = manifest_time(&manifest, "window_start");
     let we = manifest_time(&manifest, "window_end");
