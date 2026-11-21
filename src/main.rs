@@ -16,6 +16,7 @@ fn knob(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 static K_WC: LazyLock<bool> = LazyLock::new(|| knob("SESS_WC", 1) != 0);
+static K_MODE: LazyLock<usize> = LazyLock::new(|| knob("SESS_MODE", 0));
 static K_PD: LazyLock<usize> = LazyLock::new(|| knob("SESS_PD", 16));
 
 const DAY: i64 = 86_400_000;
@@ -1397,23 +1398,22 @@ fn probe3() {
     let st = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output", g])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
     eprintln!("P3 gen ok={:?} {:.1}s", st.map(|s| s.success()), t0.elapsed().as_secs_f64());
-    let variants: [(&str, &[(&str, &str)]); 8] = [
-        ("base", &[]),
-        ("avx2", &[("SESS_NO_DISPATCH", "1")]),
-        ("nowc", &[("SESS_WC", "0")]),
-        ("c256k", &[("SESS_CHUNK", "262144")]),
-        ("c4m", &[("SESS_CHUNK", "4194304")]),
-        ("pd0", &[("SESS_PD", "0")]),
-        ("pd32", &[("SESS_PD", "32")]),
-        ("t7", &[("NCPU", "7")]),
+    let variants: [(&str, &[(&str, &str)]); 7] = [
+        ("full", &[]),
+        ("P_all", &[("PARSEONLY", "1")]),
+        ("P_read", &[("PARSEONLY", "1"), ("SESS_MODE", "5")]),
+        ("P_split", &[("PARSEONLY", "1"), ("SESS_MODE", "1")]),
+        ("P_keys", &[("PARSEONLY", "1"), ("SESS_MODE", "3")]),
+        ("P_ts", &[("PARSEONLY", "1"), ("SESS_MODE", "4")]),
+        ("P_nopush", &[("PARSEONLY", "1"), ("SESS_MODE", "2")]),
     ];
     for (name, env) in variants {
         let mut best: Option<(f64, Vec<f64>)> = None;
-        for _ in 0..2 {
+        for _ in 0..3 {
             let _ = std::fs::remove_dir_all("/scratch/o");
             let t = std::time::Instant::now();
             let mut cmd = std::process::Command::new("/app/sess");
-            cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o").env("NCPU", "8");
+            cmd.env("CHILD", "1").env("VERBOSE", "1").env("SESS_NO_DISPATCH", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o").env("NCPU", "8");
             for (k, v) in env { cmd.env(k, v); }
             let out = cmd.output();
             let wall = t.elapsed().as_secs_f64();
@@ -1690,10 +1690,27 @@ fn main() {
                 let b = &st.buf[..];
                 match c.kind {
                     Kind::Ev => {
+                        let md = *K_MODE;
+                        if md == 5 {
+                            std::hint::black_box(b[s]);
+                            return;
+                        }
                         let ev = &mut st.wc;
                         let mut dc1 = DC::new();
                         let mut dc2 = DC::new();
                         for_rows_fast::<7>(b, s, e, #[inline(always)] |[eid, uid, ts, ing, et, pid, price]| {
+                            if md == 1 {
+                                std::hint::black_box(eid.len() ^ uid.len() ^ ts.len() ^ ing.len() ^ et.len() ^ pid.len() ^ price.len());
+                                return;
+                            }
+                            if md == 3 {
+                                std::hint::black_box(unsafe { (key_fast(eid), key_fast(uid)) });
+                                return;
+                            }
+                            if md == 4 {
+                                std::hint::black_box(unsafe { (parse_ts_fast(ts), parse_ingest(ing)) });
+                                return;
+                            }
                             if eid.is_empty() {
                                 return;
                             }
@@ -1741,6 +1758,10 @@ fn main() {
                                     e.cat = products.get(pid).unwrap_or(unknown_cat);
                                 }
                                 e.uid = unsafe { key_fast(uid) };
+                            }
+                            if md == 2 {
+                                std::hint::black_box(e);
+                                return;
                             }
                             ev.push(bucket(ek), e);
                         });
