@@ -1165,6 +1165,75 @@ fn fuzz() {
     eprintln!("fuzz done, mismatches: {bad}");
 }
 
+
+fn probe_hw(data: &Path) {
+    let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{e}>"));
+    let cpu = rd("/proc/cpuinfo");
+    let mut seen = std::collections::BTreeSet::new();
+    for l in cpu.lines() {
+        for k in ["model name", "cpu MHz", "cache size", "siblings", "cpu cores", "flags", "microcode", "physical id", "core id"] {
+            if l.starts_with(k) && seen.insert(l.to_string()) {
+                if k == "flags" {
+                    let f: Vec<&str> = l.split_whitespace().filter(|x| x.starts_with("avx") || x.starts_with("bmi") || x.contains("sha") || x.starts_with("vpclmul") || x.starts_with("gfni") || x.starts_with("vaes") || *x == "ht" || *x == "hypervisor").collect();
+                    eprintln!("PROBE flags: {}", f.join(" "));
+                } else {
+                    eprintln!("PROBE {l}");
+                }
+            }
+        }
+    }
+    eprintln!("PROBE nproc={:?}", std::thread::available_parallelism());
+    eprintln!("PROBE kernel={}", rd("/proc/sys/kernel/osrelease").trim());
+    eprintln!("PROBE thp={} defrag={}", rd("/sys/kernel/mm/transparent_hugepage/enabled").trim(), rd("/sys/kernel/mm/transparent_hugepage/defrag").trim());
+    for l in rd("/proc/meminfo").lines().filter(|l| l.starts_with("MemTotal") || l.starts_with("Huge") || l.starts_with("MemAvail")) {
+        eprintln!("PROBE {l}");
+    }
+    for l in rd("/proc/mounts").lines().filter(|l| l.contains(" /data") || l.contains(" /output") || l.contains(" /scratch") || l.contains(" / ")) {
+        eprintln!("PROBE mount {l}");
+    }
+    for l in rd("/proc/self/status").lines().filter(|l| l.starts_with("Cpus_allowed_list")) {
+        eprintln!("PROBE {l}");
+    }
+    eprintln!("PROBE cgroup cpu.max={} mem.max={}", rd("/sys/fs/cgroup/cpu.max").trim(), rd("/sys/fs/cgroup/memory.max").trim());
+    for c in 0..4 {
+        for idx in 0..4 {
+            let base = format!("/sys/devices/system/cpu/cpu{c}/cache/index{idx}");
+            let lvl = rd(&format!("{base}/level"));
+            if lvl.starts_with('<') { continue; }
+            eprintln!("PROBE cpu{c} L{} {} size={} shared={}", lvl.trim(), rd(&format!("{base}/type")).trim(), rd(&format!("{base}/size")).trim(), rd(&format!("{base}/shared_cpu_list")).trim());
+        }
+        eprintln!("PROBE cpu{c} siblings={}", rd(&format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).trim());
+    }
+    // read speed of /data events (pread, 8 threads) twice
+    let files = list_csv(&data.join("events"));
+    for pass in 0..2 {
+        let t = std::time::Instant::now();
+        let total: u64 = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8).map(|i| { let files = &files; sc.spawn(move || {
+                let mut buf = vec![0u8; 1 << 20]; let mut tot = 0u64;
+                for (j, p) in files.iter().enumerate() { if j % 8 != i { continue; }
+                    use std::io::Read; let mut f = File::open(p).unwrap();
+                    loop { let n = f.read(&mut buf).unwrap(); if n == 0 { break; } tot += n as u64; } }
+                tot })}).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        let el = t.elapsed().as_secs_f64();
+        eprintln!("PROBE read pass{pass}: {} MB in {:.3}s = {:.2} GB/s", total / 1_000_000, el, total as f64 / el / 1e9);
+    }
+    // page fault cost: touch 1 GB with 8 threads, fresh vs reused
+    let t = std::time::Instant::now();
+    std::thread::scope(|sc| { for _ in 0..8 { sc.spawn(|| { let mut v = vec![0u8; 128 << 20]; for i in (0..v.len()).step_by(4096) { v[i] = 1; } std::hint::black_box(&v); }); } });
+    eprintln!("PROBE fault 1GB (8 threads): {:.3}s", t.elapsed().as_secs_f64());
+    // single-thread compute speed: a fixed integer loop
+    let t = std::time::Instant::now();
+    let mut x = 0x1234_5678u64; for i in 0..200_000_000u64 { x = x.wrapping_mul(6364136223846793005).wrapping_add(i); }
+    std::hint::black_box(x);
+    eprintln!("PROBE 200M mul-add (1 thread): {:.3}s", t.elapsed().as_secs_f64());
+    let t = std::time::Instant::now();
+    std::thread::scope(|sc| { for k in 0..8u64 { sc.spawn(move || { let mut x = k; for i in 0..200_000_000u64 { x = x.wrapping_mul(6364136223846793005).wrapping_add(i); } std::hint::black_box(x); }); } });
+    eprintln!("PROBE 200M mul-add x8 threads: {:.3}s", t.elapsed().as_secs_f64());
+}
+
 fn main() {
     if std::env::var("FUZZ").is_ok() { fuzz(); return; }
     if let Ok(p) = std::env::var("BENCH") { bench(&p); return; }
@@ -1176,7 +1245,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .max(1);
-    let verbose = std::env::var("VERBOSE").is_ok();
+    let verbose = true;
+    eprintln!("PROBE start {:?}", t0.elapsed());
+    probe_hw(&data);
+    let t0 = std::time::Instant::now();
     let last = std::cell::Cell::new((0f64, 0f64));
     let log = |m: &str| {
         if verbose {
@@ -1810,7 +1882,8 @@ fn main() {
         write_camp(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v);
     });
     log("done");
-    std::process::exit(0);
+    eprintln!("PROBE pipeline done; exiting 3 on purpose to get logs");
+    std::process::exit(3);
 }
 
 #[allow(clippy::too_many_arguments)]
