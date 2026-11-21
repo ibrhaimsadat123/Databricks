@@ -939,13 +939,16 @@ fn read_chunk(f: &File, len: u64, c: &Chunk, buf: &mut Vec<u8>) -> (usize, usize
 }
 
 /// Runs `ntasks` tasks over `nt` threads; each thread owns a state.
-fn run<S: Send>(nt: usize, ntasks: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
+fn run<S: Send>(nt: usize, ntasks: usize, init: impl Fn(usize) -> S + Sync, f: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nt)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut s = init();
+            .map(|tid| {
+                let init = &init;
+                let f = &f;
+                let next = &next;
+                sc.spawn(move || {
+                    let mut s = init(tid);
                     loop {
                         let t = next.fetch_add(1, AO::Relaxed);
                         if t >= ntasks {
@@ -978,9 +981,7 @@ struct Ev {
 struct PEv {
     person: u64,
     ts: u32,
-    price: u32,
-    cat: u16,
-    typ: u8,
+    aux: u32, // 0 = not a purchase, else 1 + (tid << 26 | idx) into the purchase side tables
 }
 
 #[derive(Clone, Copy)]
@@ -1242,7 +1243,7 @@ fn main() {
             }
             let fi = files.len();
             files.push((f, len));
-            let step = if kind == Kind::Ln { 1 << 20 } else { 4 << 20 };
+            let step = 1 << 20;
             let mut s = 0;
             while s < len {
                 let e = (s + step).min(len);
@@ -1263,7 +1264,7 @@ fn main() {
     let lparts = run(
         nt,
         lchunks.len(),
-        || (Vec::<u8>::new(), Vec::<(u64, u64)>::new()),
+        |_| (Vec::<u8>::new(), Vec::<(u64, u64)>::new()),
         |st, t| {
             let c = &lchunks[t];
             let (f, len) = &files[c.file];
@@ -1339,7 +1340,7 @@ fn main() {
         let sa = run(
             nt,
             chunks.len(),
-            || SA { buf: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
+            |_| SA { buf: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
             |st, t| {
                 let c = &chunks[t];
                 let (f, len) = &files[c.file];
@@ -1432,16 +1433,18 @@ fn main() {
 
     // ---- phase B: dedup per eid bucket, map uid -> person, scatter by person bucket ----
     struct SB {
+        tid: usize,
+        pur: Vec<(u32, u16)>,
         tab: Vec<(u64, u32)>,
         dead: Vec<bool>,
         ev: Vec<Vec<PEv>>,
         ck: Vec<Vec<Ck>>,
     }
     let ptab = &ptab;
-    let sb = run(
+    let mut sb = run(
         nt,
         NB,
-        || SB { tab: vec![], dead: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
+        |tid| SB { tid, pur: vec![], tab: vec![], dead: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
         |st, b| {
             // virtual concatenation of every thread's bucket b
             let parts: Vec<&[Ev]> = sa.iter().map(|s| &s.ev[b][..]).collect();
@@ -1498,7 +1501,13 @@ fn main() {
                 for e in p.iter() {
                     if !dead[gi] && e.typ != 255 {
                         let person = ptab.get(e.uid);
-                        st.ev[bucket(person)].push(PEv { person, ts: e.ts, price: e.price, cat: e.cat, typ: e.typ });
+                        let aux = if e.typ == 2 {
+                            st.pur.push((e.price, e.cat));
+                            1 + (((st.tid as u32) << 26) | (st.pur.len() as u32 - 1))
+                        } else {
+                            0
+                        };
+                        st.ev[bucket(person)].push(PEv { person, ts: e.ts, aux });
                     }
                     gi += 1;
                 }
@@ -1513,6 +1522,7 @@ fn main() {
         },
     );
     drop(sa);
+    let purs: Vec<Vec<(u32, u16)>> = sb.iter_mut().map(|s| std::mem::take(&mut s.pur)).collect();
     let sc = sb;
     log("dedup+map");
 
@@ -1538,20 +1548,19 @@ fn main() {
     let sd = run(
         nt,
         NB,
-        || SD { ev: vec![], ck: vec![], evs: vec![], cks: vec![], k1: vec![], k2: vec![], map: FxHashMap::default(), li: vec![], cli: vec![], cnt: vec![], eoff: vec![], coff: vec![], users: vec![], camp: vec![[0; 4]; ncamp * ndays] },
+        |_| SD { ev: vec![], ck: vec![], evs: vec![], cks: vec![], k1: vec![], k2: vec![], map: FxHashMap::default(), li: vec![], cli: vec![], cnt: vec![], eoff: vec![], coff: vec![], users: vec![], camp: vec![[0; 4]; ncamp * ndays] },
         |st, b| {
-            st.ev.clear();
             st.ck.clear();
             for s in &sc {
-                st.ev.extend_from_slice(&s.ev[b]);
                 st.ck.extend_from_slice(&s.ck[b]);
             }
+            let parts: Vec<&[PEv]> = sc.iter().map(|s| &s.ev[b][..]).collect();
             // local person index (order of first appearance)
-            let n = st.ev.len();
+            let n: usize = parts.iter().map(|p| p.len()).sum();
             st.map.clear();
             st.li.clear();
             st.cnt.clear();
-            for e in st.ev.iter() {
+            for e in parts.iter().flat_map(|p| p.iter()) {
                 let next = st.cnt.len() as u32;
                 let l = *st.map.entry(e.person).or_insert(next);
                 if l == next {
@@ -1570,7 +1579,17 @@ fn main() {
             }
             // LSD radix sort of (ts, index) by ts: 3 passes of 11 bits
             st.k1.clear();
-            st.k1.extend(st.ev.iter().enumerate().map(|(i, e)| ((e.ts as u64) << 32) | i as u64));
+            for (pi, p) in parts.iter().enumerate() {
+                st.k1.extend(p.iter().enumerate().map(|(i, e)| ((e.ts as u64) << 32) | ((pi as u64) << 26) | i as u64));
+            }
+            let mut poff = [0u32; 64];
+            {
+                let mut o = 0u32;
+                for (pi, p) in parts.iter().enumerate() {
+                    poff[pi] = o;
+                    o += p.len() as u32;
+                }
+            }
             st.k2.clear();
             st.k2.resize(n, 0);
             {
@@ -1607,9 +1626,10 @@ fn main() {
             unsafe { st.evs.set_len(n) };
             st.cnt.copy_from_slice(&st.eoff[..m]);
             for &k in st.k2.iter() {
-                let i = (k & 0xFFFF_FFFF) as usize;
-                let l = st.li[i] as usize;
-                st.evs[st.cnt[l] as usize] = st.ev[i];
+                let pi = ((k >> 26) & 63) as usize;
+                let i = (k & ((1 << 26) - 1)) as usize;
+                let l = st.li[poff[pi] as usize + i] as usize;
+                st.evs[st.cnt[l] as usize] = parts[pi][i];
                 st.cnt[l] += 1;
             }
             // clicks: same person order; clicks of persons without events are dropped
@@ -1648,7 +1668,7 @@ fn main() {
                     g.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| cmp_key(x.cid, y.cid)));
                 }
             }
-            process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.users, &mut st.camp, ncat, ndays, ws, cws, organic, &cat_rank);
+            process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.users, &mut st.camp, ncat, ndays, ws, cws, organic, &cat_rank, &purs);
         },
     );
     drop(sc);
@@ -1693,6 +1713,7 @@ fn main() {
         write_camp(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v);
     });
     log("done");
+    std::process::exit(0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1709,6 +1730,7 @@ fn process_bucket(
     cws: i64,
     organic: u16,
     cat_rank: &[usize],
+    purs: &[Vec<(u32, u16)>],
 ) {
     let base_day = ws.div_euclid(DAY);
     let mut catsum = vec![0i64; ncat];
@@ -1770,13 +1792,15 @@ fn process_bucket(
                 let e = ev[k];
                 last = e.ts as i64;
                 n += 1;
-                if e.typ == 2 {
+                if e.aux != 0 {
+                    let a = e.aux - 1;
+                    let (price, cat) = purs[(a >> 26) as usize][(a & ((1 << 26) - 1)) as usize];
                     pur = true;
-                    rev += e.price as i64;
-                    if catsum[e.cat as usize] == 0 {
-                        touched.push(e.cat);
+                    rev += price as i64;
+                    if catsum[cat as usize] == 0 {
+                        touched.push(cat);
                     }
-                    catsum[e.cat as usize] += e.price as i64;
+                    catsum[cat as usize] += price as i64;
                 }
                 k += 1;
             }
