@@ -16,26 +16,14 @@ const WEEK: i64 = 7 * DAY;
 const NB: usize = 256;
 
 // ---------- keys ----------
-// Strings of at most 10 chars from [0-9_a-z] are packed 6 bits per char
-// (0 = padding), which preserves byte-wise order. Anything else is interned
-// and gets the top bit set; comparisons involving those go through bytes.
-static ALPHA: LazyLock<[u8; 256]> = LazyLock::new(|| {
-    let mut t = [0u8; 256];
-    let mut v = 1u8;
-    for c in b'0'..=b'9' {
-        t[c as usize] = v;
-        v += 1;
-    }
-    t[b'_' as usize] = v;
-    v += 1;
-    for c in b'a'..=b'z' {
-        t[c as usize] = v;
-        v += 1;
-    }
-    t
-});
-const DEC: &[u8; 38] = b"\x000123456789_abcdefghijklmnopqrstuvwxyz";
+// Strings of at most 9 bytes, every byte in 1..=127, are packed 7 bits per byte
+// (big-endian, 0 = padding) into 63 bits, which preserves byte-wise order.
+// Anything else is interned and gets the top bit set; comparisons involving
+// those go through bytes.
 const FALLBACK: u64 = 1 << 63;
+const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+const HI8: u64 = 0x8080_8080_8080_8080;
+const ONES: u64 = 0x0101_0101_0101_0101;
 
 struct Interner {
     map: FxHashMap<Vec<u8>, u64>,
@@ -45,23 +33,62 @@ static INTERN: LazyLock<Mutex<Interner>> =
     LazyLock::new(|| Mutex::new(Interner { map: FxHashMap::default(), strs: vec![] }));
 
 #[inline(always)]
-fn key(s: &[u8]) -> u64 {
-    if s.len() <= 10 {
-        let t = &*ALPHA;
-        let mut v: u64 = 0;
-        let mut bad = 0u8;
-        for &c in s {
-            let d = t[c as usize];
-            bad |= (d == 0) as u8;
-            v = (v << 6) | d as u64;
-        }
-        if bad != 0 {
-            return intern(s);
-        }
-        v << (6 * (10 - s.len()))
-    } else {
-        intern(s)
+fn pext7(x: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        return std::arch::x86_64::_pext_u64(x, LOW7);
     }
+    #[allow(unreachable_code)]
+    {
+        let mut v = 0u64;
+        for i in (0..8).rev() {
+            v = (v << 7) | ((x >> (8 * i)) & 0x7F);
+        }
+        v
+    }
+}
+
+/// x = first 8 bytes little-endian with bytes past len zeroed; c9 = 9th byte or 0.
+#[inline(always)]
+fn pack(x: u64, c9: u8, len: usize) -> Option<u64> {
+    // valid bytes: 1..=127 within len
+    let lm = if len >= 8 { u64::MAX } else { (1u64 << (8 * len)) - 1 };
+    let t = x | (!lm & ONES);
+    let zero = (t.wrapping_sub(ONES)) & !t & HI8;
+    if (x & HI8) != 0 || zero != 0 || c9 >= 128 || (len == 9 && c9 == 0) {
+        return None;
+    }
+    Some((pext7(x.swap_bytes()) << 7) | c9 as u64)
+}
+
+#[inline(always)]
+fn key(s: &[u8]) -> u64 {
+    let n = s.len();
+    if n <= 9 {
+        let mut b = [0u8; 9];
+        b[..n].copy_from_slice(s);
+        let x = u64::from_le_bytes(b[..8].try_into().unwrap());
+        if let Some(k) = pack(x, b[8], n) {
+            return k;
+        }
+    }
+    intern(s)
+}
+
+/// Same as key, but may read up to 9 bytes past the start of s (caller guarantees padding).
+#[inline(always)]
+unsafe fn key_fast(s: &[u8]) -> u64 {
+    let n = s.len();
+    if n <= 9 {
+        let p = s.as_ptr();
+        let raw = unsafe { std::ptr::read_unaligned(p as *const u64) };
+        let lm = if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
+        let c9 = if n == 9 { unsafe { *p.add(8) } } else { 0 };
+        if let Some(k) = pack(raw & lm, c9, n) {
+            return k;
+        }
+    }
+    intern(s)
 }
 
 #[cold]
@@ -81,13 +108,13 @@ fn key_bytes(k: u64) -> Vec<u8> {
     if k & FALLBACK != 0 {
         INTERN.lock().unwrap().strs[(k & !FALLBACK) as usize].clone()
     } else {
-        let mut out = Vec::with_capacity(10);
-        for i in (0..10).rev() {
-            let d = ((k >> (6 * i)) & 63) as usize;
-            if d == 0 {
+        let mut out = Vec::with_capacity(9);
+        for i in 0..9 {
+            let c = ((k >> (7 * (8 - i))) & 0x7F) as u8;
+            if c == 0 {
                 break;
             }
-            out.push(DEC[d]);
+            out.push(c);
         }
         out
     }
@@ -315,6 +342,138 @@ fn parse_ts_c(b: &[u8], dc: &mut DC) -> Option<i64> {
         return Some(i64::MAX);
     }
     Some(v as i64)
+}
+
+// ---------- fast timestamps (SWAR) ----------
+const DIGIT_LO: u64 = 0x3030_3030_3030_3030;
+
+/// All 8 bytes of x (each already minus '0') are 0..=9.
+#[inline(always)]
+fn all_digits(d: u64) -> bool {
+    // a byte b is 0..=9 iff b < 10, i.e. (b + 0x76) has high bit 0 and b has high bit 0
+    ((d.wrapping_add(0x7676_7676_7676_7676) | d) & HI8) == 0
+}
+
+/// 8 digit values (LE, first char most significant) -> number.
+#[inline(always)]
+fn swar8(d: u64) -> u64 {
+    let x = (d.wrapping_mul(10)).wrapping_add(d >> 8) & 0x00FF_00FF_00FF_00FF;
+    let x = (x.wrapping_mul(100)).wrapping_add(x >> 16) & 0x0000_FFFF_0000_FFFF;
+    (x.wrapping_mul(10000)).wrapping_add(x >> 32) & 0xFFFF_FFFF
+}
+
+struct YearTab {
+    y0: i64,
+    start: [i64; 8], // days_from_civil(y0 + i, 1, 1)
+}
+static YT: std::sync::OnceLock<YearTab> = std::sync::OnceLock::new();
+const MCUM: [[i64; 13]; 2] = [
+    [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334],
+    [0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335],
+];
+const MDIM: [[i64; 13]; 2] = [[0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]];
+
+#[inline(always)]
+fn civil_days(y: i64, mo: i64, d: i64) -> Option<i64> {
+    if !(1..=12).contains(&mo) || d < 1 {
+        return None;
+    }
+    let lp = leap(y) as usize;
+    if d > MDIM[lp][mo as usize] {
+        return None;
+    }
+    if let Some(t) = YT.get() {
+        let i = y - t.y0;
+        if (0..8).contains(&i) {
+            return Some(t.start[i as usize] + MCUM[lp][mo as usize] + d - 1);
+        }
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
+/// Timestamp parse; may read up to 32 bytes from b's start (caller guarantees padding).
+#[inline(always)]
+unsafe fn parse_ts_fast(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    let p = b.as_ptr();
+    if (n == 20 || n == 25) && unsafe { *p.add(4) } == b'-' {
+        let v0 = unsafe { std::ptr::read_unaligned(p as *const u64) }; // YYYY-MM-
+        let v1 = unsafe { std::ptr::read_unaligned(p.add(8) as *const u64) }; // DDTHH:MM
+        let v2 = unsafe { std::ptr::read_unaligned(p.add(16) as *const u32) } as u64; // :SS?
+        // separators
+        const M0: u64 = 0xFF00_00FF_0000_0000; // bytes 4 and 7
+        const P0: u64 = 0x2D00_002D_0000_0000;
+        const M1: u64 = 0x0000_FF00_00FF_0000; // bytes 2 (T) and 5 (:)
+        const P1: u64 = 0x0000_3A00_0054_0000;
+        if (v0 & M0) != P0 || (v1 & M1) != P1 || (v2 & 0xFF) != 0x3A {
+            return None;
+        }
+        // digits: bytes 0-3,5-6 of v0; 0-1,3-4,6-7 of v1; 1-2 of v2
+        const D0: u64 = 0x00FF_FF00_FFFF_FFFF;
+        const D1: u64 = 0xFFFF_00FF_FF00_FFFF;
+        let d0 = (v0 & D0).wrapping_sub(DIGIT_LO & D0);
+        let d1 = (v1 & D1).wrapping_sub(DIGIT_LO & D1);
+        let d2v = (v2 & 0x00FF_FF00).wrapping_sub(0x0030_3000);
+        if !all_digits(d0) || !all_digits(d1) || !all_digits(d2v) {
+            return None;
+        }
+        let byte = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as i64;
+        let y = byte(d0, 0) * 1000 + byte(d0, 1) * 100 + byte(d0, 2) * 10 + byte(d0, 3);
+        let mo = byte(d0, 5) * 10 + byte(d0, 6);
+        let d = byte(d1, 0) * 10 + byte(d1, 1);
+        let h = byte(d1, 3) * 10 + byte(d1, 4);
+        let mi = byte(d1, 6) * 10 + byte(d1, 7);
+        let s = byte(d2v, 1) * 10 + byte(d2v, 2);
+        if h > 23 || mi > 59 || s > 59 {
+            return None;
+        }
+        let days = civil_days(y, mo, d)?;
+        let mut ms = days * DAY + (h * 3600 + mi * 60 + s) * 1000;
+        let c19 = unsafe { *p.add(19) };
+        if n == 20 {
+            if c19 != b'Z' {
+                return None;
+            }
+        } else {
+            let sign = match c19 {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if unsafe { *p.add(22) } != b':' {
+                return None;
+            }
+            let oh = d2(b, 20)?;
+            let om = d2(b, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            ms -= sign * (oh * 60 + om) * 60_000;
+        }
+        return Some(ms);
+    }
+    if n == 0 {
+        return None;
+    }
+    if n <= 16 {
+        // right-align the digits in 16 bytes padded with '0'
+        let raw = unsafe { std::ptr::read_unaligned(p as *const u128) };
+        let sh = 8 * (16 - n) as u32;
+        let v = if sh == 0 { raw } else { (raw << sh) | (0x3030_3030_3030_3030_3030_3030_3030_3030u128 & ((1u128 << sh) - 1)) };
+        let lo = (v as u64).wrapping_sub(DIGIT_LO);
+        let hi = ((v >> 64) as u64).wrapping_sub(DIGIT_LO);
+        // bytes below '0' wrap to >= 0xD0 and are caught by the high-bit test
+        if ((v as u64) & HI8) != 0 || (((v >> 64) as u64) & HI8) != 0 || !all_digits(lo) || !all_digits(hi) {
+            return None;
+        }
+        // reject bytes < '0' (subtraction borrowed): check each original byte >= '0'
+        let ge = |x: u64| ((x | HI8).wrapping_sub(DIGIT_LO) & HI8) == HI8;
+        if !ge(v as u64) || !ge((v >> 64) as u64) {
+            return None;
+        }
+        return Some((swar8(lo) * 100_000_000 + swar8(hi)) as i64);
+    }
+    parse_ts(b)
 }
 
 #[inline]
@@ -636,7 +795,7 @@ fn for_rows_fast<const N: usize>(buf: &[u8], s: usize, e: usize, mut g: impl FnM
                     } else {
                         le_off
                     };
-                    if fe >= fs + 2 && (quotes >> fs) & 1 == 1 && (quotes >> (fe - 1)) & 1 == 1 {
+                    if fe >= fs + 2 && buf[ls + fs] == b'"' && buf[ls + fe - 1] == b'"' {
                         a[k] = &buf[ls + fs + 1..ls + fe - 1];
                         cand += 1;
                     } else {
@@ -862,7 +1021,61 @@ fn bench(path: &str) {
     best("+ts", &mut || { let mut c = 0u64; for_rows_fast::<7>(full, s0, e0, |a| c = c.wrapping_add(parse_ts(a[2]).unwrap_or(0) as u64 ^ parse_ts(a[3]).unwrap_or(0) as u64)); c });
 }
 
+
+fn fuzz() {
+    let _ = YT.set(YearTab { y0: 2025, start: std::array::from_fn(|i| days_from_civil(2025 + i as i64, 1, 1)) });
+    let mut rng: u64 = 0x1234_5678_9abc_def1;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let seeds: Vec<&[u8]> = vec![
+        b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"1791071890000", b"0001791071890000",
+        b"2028-02-29T00:00:00Z", b"2027-02-29T00:00:00Z", b"2026-12-31T23:59:59+23:59", b"2026-01-01T00:00:00-00:00",
+        b"86400000", b"123456789012345678901", b"9999-12-31T23:59:59Z", b"0000-01-01T00:00:00Z", b"18446744073709551616",
+    ];
+    let alpha = b"0123456789-:TZtz+ .\r/\x00\xff";
+    let mut buf = vec![0u8; 256];
+    let mut bad = 0;
+    for it in 0..20_000_000u64 {
+        let base = seeds[(next() % seeds.len() as u64) as usize];
+        let mut v = base.to_vec();
+        let muts = next() % 4;
+        for _ in 0..muts {
+            let r = next();
+            match r % 4 {
+                0 if !v.is_empty() => { let i = (r >> 8) as usize % v.len(); v[i] = alpha[(r >> 20) as usize % alpha.len()]; }
+                1 if !v.is_empty() => { let i = (r >> 8) as usize % v.len(); v.remove(i); }
+                2 => { let i = (r >> 8) as usize % (v.len() + 1); v.insert(i, alpha[(r >> 20) as usize % alpha.len()]); }
+                _ if !v.is_empty() => { let i = (r >> 8) as usize % v.len(); v[i] = (r >> 30) as u8; }
+                _ => {}
+            }
+        }
+        // random garbage after the field
+        for x in buf.iter_mut() { *x = (next() & 0xFF) as u8; }
+        buf[..v.len()].copy_from_slice(&v);
+        let a = parse_ts(&v);
+        let b = unsafe { parse_ts_fast(&buf[..v.len()]) };
+        let norm = |x: Option<i64>| x.map(|t| if t >= 1_000_000_000_000_000_000 { i64::MAX } else { t });
+        if norm(a) != norm(b) {
+            bad += 1;
+            if bad < 10 { eprintln!("MISMATCH it={it} {:?} slow={a:?} fast={b:?}", String::from_utf8_lossy(&v)); }
+        }
+        // keys
+        let k1 = key(&v);
+        let k2 = unsafe { key_fast(&buf[..v.len()]) };
+        if k1 != k2 || key_bytes(k1) != v {
+            bad += 1;
+            if bad < 10 { eprintln!("KEY MISMATCH {:?}", v); }
+        }
+    }
+    eprintln!("fuzz done, mismatches: {bad}");
+}
+
 fn main() {
+    if std::env::var("FUZZ").is_ok() { fuzz(); return; }
     if let Ok(p) = std::env::var("BENCH") { bench(&p); return; }
     let t0 = std::time::Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
@@ -891,6 +1104,22 @@ fn main() {
     let we = manifest_time(&manifest, "window_end");
     let cws = ws - WEEK;
     assert!(we - cws < u32::MAX as i64);
+    {
+        let dd = cws.div_euclid(DAY);
+        let mut y = 1970i64;
+        while days_from_civil(y + 1, 1, 1) <= dd {
+            y += 1;
+        }
+        while days_from_civil(y, 1, 1) > dd {
+            y -= 1;
+        }
+        let y0 = y - 1;
+        let mut start = [0i64; 8];
+        for i in 0..8 {
+            start[i] = days_from_civil(y0 + i as i64, 1, 1);
+        }
+        let _ = YT.set(YearTab { y0, start });
+    }
 
     // products -> categories
     let mut cat_names: Vec<Vec<u8>> = vec![];
@@ -992,7 +1221,7 @@ fn main() {
             let ln = &mut st.1;
             for_rows_fast::<2>(&st.0, s, e, |[a, bb]| {
                 if !a.is_empty() && !bb.is_empty() {
-                    ln.push((key(a), key(bb)));
+                    ln.push(unsafe { (key_fast(a), key_fast(bb)) });
                 }
             });
         },
@@ -1075,15 +1304,15 @@ fn main() {
                             if eid.is_empty() {
                                 return;
                             }
-                            let ek = key(eid);
-                            let ingest_ms = parse_ts_c(ing, &mut dc2).unwrap_or(i64::MAX);
+                            let ek = unsafe { key_fast(eid) };
+                            let ingest_ms = unsafe { parse_ts_fast(ing) }.unwrap_or(i64::MAX);
                             let ingest = (ingest_ms.saturating_sub(ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                             let mut e = Ev { eid: ek, uid: 0, ingest, ts: 0, price: 0, cat: 0, typ: 255, dead: false };
                             'v: {
                                 if uid.is_empty() || pid.is_empty() {
                                     break 'v;
                                 }
-                                let Some(t) = parse_ts_c(ts, &mut dc1) else { break 'v };
+                                let Some(t) = (unsafe { parse_ts_fast(ts) }) else { break 'v };
                                 if t < ws || t >= we || ingest_ms.saturating_sub(t) > DAY {
                                     break 'v;
                                 }
@@ -1104,7 +1333,7 @@ fn main() {
                                 if typ == 2 {
                                     e.cat = products.get(pid).unwrap_or(unknown_cat);
                                 }
-                                e.uid = key(uid);
+                                e.uid = unsafe { key_fast(uid) };
                             }
                             ev[bucket(ek)].push(e);
                         });
@@ -1116,13 +1345,13 @@ fn main() {
                             if cid.is_empty() || uid.is_empty() {
                                 return;
                             }
-                            let Some(t) = parse_ts_c(ts, &mut dc1) else { return };
+                            let Some(t) = (unsafe { parse_ts_fast(ts) }) else { return };
                             if t < cws || t >= we {
                                 return;
                             }
                             let Some(ci) = campaigns.get(camp) else { return };
-                            let u = key(uid);
-                            ck[bucket(u)].push(Ck { person: u, cid: key(cid), ts: (t - cws) as u32, camp: ci });
+                            let u = unsafe { key_fast(uid) };
+                            ck[bucket(u)].push(Ck { person: u, cid: unsafe { key_fast(cid) }, ts: (t - cws) as u32, camp: ci });
                         });
                     }
                     Kind::Ln => {}
