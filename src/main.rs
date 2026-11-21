@@ -1231,6 +1231,7 @@ fn main() {
     let mut chunks: Vec<Chunk> = vec![];
     let mut lchunks: Vec<Chunk> = vec![];
     let mut total_ev: u64 = 0;
+    let mut total_ck: u64 = 0;
     for (kind, dir) in [(Kind::Ev, "events"), (Kind::Ck, "clicks"), (Kind::Ln, "links")] {
         for p in list_csv(&data.join(dir)) {
             let Ok(f) = File::open(&p) else { continue };
@@ -1240,6 +1241,9 @@ fn main() {
             }
             if kind == Kind::Ev {
                 total_ev += len;
+            }
+            if kind == Kind::Ck {
+                total_ck += len;
             }
             let fi = files.len();
             files.push((f, len));
@@ -1257,8 +1261,10 @@ fn main() {
             }
         }
     }
-    let est = (total_ev / 72) as usize;
-    let cap = est / nt / NB + est / nt / NB / 8 + 16;
+    let est = (total_ev / 70) as usize;
+    let cap = est / nt / NB + est / nt / NB / 4 + 64;
+    let est_ck = (total_ck / 46) as usize;
+    let cap_ck = est_ck / nt / NB + est_ck / nt / NB / 4 + 64;
 
     // ---- links: parse (small), then union-find on a side thread during parsing ----
     let lparts = run(
@@ -1340,7 +1346,7 @@ fn main() {
         let sa = run(
             nt,
             chunks.len(),
-            |_| SA { buf: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
+            |_| SA { buf: vec![], ev: buckets(cap), ck: buckets(cap_ck) },
             |st, t| {
                 let c = &chunks[t];
                 let (f, len) = &files[c.file];
@@ -1435,7 +1441,7 @@ fn main() {
     struct SB {
         tid: usize,
         pur: Vec<(u32, u16)>,
-        tab: Vec<(u64, u32)>,
+        tab: Vec<(u64, u32, u32)>,
         dead: Vec<bool>,
         ev: Vec<Vec<PEv>>,
         ck: Vec<Vec<Ck>>,
@@ -1444,14 +1450,17 @@ fn main() {
     let mut sb = run(
         nt,
         NB,
-        |tid| SB { tid, pur: vec![], tab: vec![], dead: vec![], ev: buckets(cap), ck: buckets(cap / 4) },
+        |tid| SB { tid, pur: Vec::with_capacity(est / nt / 20 + 64), tab: vec![], dead: vec![], ev: buckets(cap), ck: buckets(cap_ck) },
         |st, b| {
             // virtual concatenation of every thread's bucket b
             let parts: Vec<&[Ev]> = sa.iter().map(|s| &s.ev[b][..]).collect();
             let n: usize = parts.iter().map(|p| p.len()).sum();
+            // generation-tagged table: slots from other buckets count as empty, so no clearing
             let tcap = (n * 2).next_power_of_two().max(16);
-            st.tab.clear();
-            st.tab.resize(tcap, (u64::MAX, 0));
+            if st.tab.len() < tcap {
+                st.tab.resize(tcap, (0, 0, 0));
+            }
+            let generation = b as u32 + 1;
             st.dead.clear();
             st.dead.resize(n, false);
             let mask = tcap - 1;
@@ -1477,8 +1486,8 @@ fn main() {
                     let mut h = (mix(k) as usize) & mask;
                     loop {
                         let slot = tab[h];
-                        if slot.0 == u64::MAX {
-                            tab[h] = (k, gi as u32);
+                        if slot.2 != generation {
+                            tab[h] = (k, gi as u32, generation);
                             break;
                         }
                         if slot.0 == k {
@@ -1548,7 +1557,7 @@ fn main() {
     let sd = run(
         nt,
         NB,
-        |_| SD { ev: vec![], ck: vec![], evs: vec![], cks: vec![], k1: vec![], k2: vec![], map: FxHashMap::default(), li: vec![], cli: vec![], cnt: vec![], eoff: vec![], coff: vec![], users: vec![], camp: vec![[0; 4]; ncamp * ndays] },
+        |_| SD { ev: vec![], ck: vec![], evs: vec![], cks: vec![], k1: vec![], k2: vec![], map: FxHashMap::default(), li: vec![], cli: vec![], cnt: vec![], eoff: vec![], coff: vec![], users: Vec::with_capacity(est / nt / 8 + 64), camp: vec![[0; 4]; ncamp * ndays] },
         |st, b| {
             st.ck.clear();
             for s in &sc {
