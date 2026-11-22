@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 static NSLOW: AtomicU64 = AtomicU64::new(0);
 static NSLOWC: AtomicU64 = AtomicU64::new(0);
+/// software prefetch distance in the line parsers (bytes ahead of the current line)
+const K_PF: usize = 1024;
 static K_VAR: LazyLock<u32> = LazyLock::new(|| knob("SESS_VAR", 200) as u32);
 static K_CHUNK: LazyLock<usize> = LazyLock::new(|| knob("SESS_CHUNK", 1 << 20));
-static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 0) != 0);
+static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 1) != 0);
 static K_S2: LazyLock<bool> = LazyLock::new(|| knob("SESS_S2", 1) != 0);
 static K_POP: LazyLock<bool> = LazyLock::new(|| knob("SESS_POP", 0) != 0);
 static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1024).max(16));
@@ -2210,6 +2212,9 @@ fn parse_ev4<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mu
         'line: while ls < e {
             let lim = e - ls;
             let lp = base.add(ls);
+            if K_PF != 0 {
+                _mm_prefetch::<_MM_HINT_T0>(lp.add(K_PF) as *const i8);
+            }
             let y0 = _mm256_loadu_si256(lp as *const __m256i);
             let y1 = _mm256_loadu_si256(lp.add(32) as *const __m256i);
             let y2 = _mm256_loadu_si256(lp.add(64) as *const __m256i);
@@ -2480,6 +2485,7 @@ fn parse_ck2(buf: &[u8], s: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 8>, s
         'line: while ls < e {
             let lim = e - ls;
             let lp = base.add(ls);
+            _mm_prefetch::<_MM_HINT_T0>(lp.add(K_PF) as *const i8);
             let y0 = _mm256_loadu_si256(lp as *const __m256i);
             let y1 = _mm256_loadu_si256(lp.add(32) as *const __m256i);
             let nm = mm(y0, nl) | (mm(y1, nl) << 32);
