@@ -16,7 +16,7 @@ static K_CHUNK: LazyLock<usize> = LazyLock::new(|| knob("SESS_CHUNK", 1 << 20));
 static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 0) != 0);
 static K_S2: LazyLock<bool> = LazyLock::new(|| knob("SESS_S2", 1) != 0);
 static K_POP: LazyLock<bool> = LazyLock::new(|| knob("SESS_POP", 0) != 0);
-static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1024).max(16));
+static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1536).max(16));
 static K_SEGF: LazyLock<usize> = LazyLock::new(|| knob("SESS_SEGF", 4).max(1));
 pub(crate) const MASK40: u64 = (1 << 40) - 1;
 const A0: u64 = 0x9E37_79B9_7F4B;
@@ -3276,6 +3276,16 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let nlc = lchunks.len();
     let link_slots: Vec<Mutex<Vec<(u64, u64, u64, u64)>>> = (0..nlc).map(|_| Mutex::new(vec![])).collect();
     let links_left = std::sync::atomic::AtomicUsize::new(nlc);
+    let pers_slot: Mutex<Option<Persons>> = Mutex::new(None);
+    let run_uf = |slots: &[Mutex<Vec<(u64, u64, u64, u64)>>]| -> Persons {
+        let lparts: Vec<(Vec<u8>, Vec<(u64, u64, u64, u64)>)> = slots.iter().map(|m| (vec![], std::mem::take(&mut *m.lock().unwrap()))).collect();
+        let t = std::time::Instant::now();
+        let r = if std::env::var_os("SESS_UF1").is_some() { build_persons(&lparts) } else { build_persons2(&lparts) };
+        if std::env::var_os("VERBOSE").is_some() {
+            eprintln!("union-find {:.3}s classes {}", t.elapsed().as_secs_f64(), r.cname.len());
+        }
+        r
+    };
     let parse_links = |t: usize, buf: &mut Vec<u8>| {
         let c = &lchunks[t];
         let (f, len) = &files[c.file];
@@ -3289,7 +3299,11 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             }
         });
         *link_slots[t].lock().unwrap() = ln;
-        links_left.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        if links_left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            // the last link chunk: this worker runs union-find before going back to parsing
+            // (no extra thread competing with the parse workers)
+            *pers_slot.lock().unwrap() = Some(run_uf(&link_slots));
+        }
     };
 
     // ---- phase A: parse events and clicks (union-find runs alongside) ----
@@ -3309,21 +3323,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let campaigns = &campaigns;
     let evcx = &EvCtx { ws, we, ukey, ekey, vb, psh, vmask, evwin, evloc, ingtab, products, unknown_cat };
     let ckcx = &CkCtx { cws, we, ukey, ckey, ckwin, ckloc, campaigns: &campaigns };
-    let (pers, sa) = std::thread::scope(|scope| {
-        let (link_slots, links_left) = (&link_slots, &links_left);
-        let uf = scope.spawn(move || {
-            while links_left.load(std::sync::atomic::Ordering::Acquire) != 0 {
-                std::thread::sleep(std::time::Duration::from_micros(50));
-            }
-            let lparts: Vec<(Vec<u8>, Vec<(u64, u64, u64, u64)>)> = link_slots.iter().map(|m| (vec![], std::mem::take(&mut *m.lock().unwrap()))).collect();
-            let lparts = &lparts;
-            let t = std::time::Instant::now();
-            let r = if std::env::var_os("SESS_UF1").is_some() { build_persons(lparts) } else { build_persons2(lparts) };
-            if std::env::var_os("VERBOSE").is_some() {
-                eprintln!("union-find {:.3}s classes {}", t.elapsed().as_secs_f64(), r.cname.len());
-            }
-            r
-        });
+    let sa = {
         let sa = run(
             nt,
             nlc + chunks.len(),
@@ -3439,8 +3439,12 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 }
             },
         );
-        (uf.join().unwrap(), sa)
-    });
+        sa
+    };
+    let pers = match pers_slot.into_inner().unwrap() {
+        Some(p) => p,
+        None => run_uf(&link_slots),
+    };
     let mut sa = sa;
     for s in sa.iter_mut() {
         if *K_VAR & 8 != 0 {
