@@ -12,6 +12,8 @@ static NSLOWC: AtomicU64 = AtomicU64::new(0);
 static K_VAR: LazyLock<u32> = LazyLock::new(|| knob("SESS_VAR", 200) as u32);
 static K_CHUNK: LazyLock<usize> = LazyLock::new(|| knob("SESS_CHUNK", 1 << 20));
 static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 0) != 0);
+static K_S2: LazyLock<bool> = LazyLock::new(|| knob("SESS_S2", 1) != 0);
+static K_POP: LazyLock<bool> = LazyLock::new(|| knob("SESS_POP", 0) != 0);
 static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1024).max(16));
 static K_SEGF: LazyLock<usize> = LazyLock::new(|| knob("SESS_SEGF", 4).max(1));
 pub(crate) const MASK40: u64 = (1 << 40) - 1;
@@ -964,6 +966,10 @@ struct SessSc {
     pstamp: u32,
     cts: Vec<i64>,
     s_nxt: Vec<u32>,
+    s2_start: Vec<u32>,
+    s2_day: Vec<u32>,
+    s2_rev: Vec<i64>,
+    s2_pur: Vec<u8>,
 }
 
 /// ev: one person's events sorted by ts; cl: the person's valid clicks sorted by ts.
@@ -1104,6 +1110,177 @@ fn sess_one(name: u64, ev: &[UEv], cl: &[C16], cx: &SessCx, sc: &mut SessSc, use
     }
 }
 
+/// sess_one with the same results and less work per event and session: times stay relative
+/// (session starts in ms since ws, clicks in ms since ws - 7 days, so a click at c qualifies for a
+/// session at s iff s <= c <= s + WEEK), session data goes to preallocated arrays, and no bounds checks.
+#[allow(clippy::too_many_arguments)]
+fn sess_two(name: u64, ev: &[UEv], cl: &[C16], cx: &SessCx, sc: &mut SessSc, users: &mut Vec<UserRow>, camp_out: &mut [[i64; 4]]) {
+    let n = ev.len();
+    if n == 0 {
+        return;
+    }
+    let ndays = cx.ndays;
+    let base_day = cx.ws.div_euclid(DAY);
+    let off = (cx.ws - base_day * DAY) as u64; // 0 for a midnight window start
+    if sc.s2_start.len() < n {
+        sc.s2_start.resize(n, 0);
+        sc.s2_day.resize(n, 0);
+        sc.s2_rev.resize(n, 0);
+        sc.s2_pur.resize(n, 0);
+    }
+    let cat_rank = cx.cat_rank;
+    let mut ns = 0usize;
+    unsafe {
+        let p = ev.as_ptr();
+        let ss = sc.s2_start.as_mut_ptr();
+        let sd = sc.s2_day.as_mut_ptr();
+        let sr = sc.s2_rev.as_mut_ptr();
+        let sp = sc.s2_pur.as_mut_ptr();
+        let catsum = sc.catsum.as_mut_ptr();
+        let mut cur_day = u32::MAX;
+        let (mut d_s, mut d_e, mut d_r) = (0i64, 0i64, 0i64);
+        let mut k = 0usize;
+        while k < n {
+            let st = (*p.add(k)).ts;
+            let day = ((st as u64 + off) / DAY as u64) as u32;
+            if day != cur_day {
+                if cur_day != u32::MAX {
+                    sess_flush(name, base_day + cur_day as i64, d_s, d_e, d_r, &mut sc.catsum, &mut sc.touched, cat_rank, users);
+                }
+                cur_day = day;
+                d_s = 0;
+                d_e = 0;
+                d_r = 0;
+            }
+            let k0 = k;
+            let mut last = st;
+            let mut rev = 0i64;
+            let mut pur = 0u8;
+            while k < n {
+                let e = *p.add(k);
+                if e.ts.wrapping_sub(last) > GAP as u32 {
+                    break;
+                }
+                last = e.ts;
+                if e.tc & 3 == 2 {
+                    let cat = (e.tc >> 2) as usize;
+                    pur = 1;
+                    rev += e.price as i64;
+                    let cs = &mut *catsum.add(cat);
+                    if *cs == 0 {
+                        sc.touched.push(cat as u16);
+                    }
+                    *cs += e.price as i64;
+                }
+                k += 1;
+            }
+            *ss.add(ns) = st;
+            *sd.add(ns) = day;
+            *sr.add(ns) = rev;
+            *sp.add(ns) = pur;
+            ns += 1;
+            d_s += 1;
+            d_e += (k - k0) as i64;
+            d_r += rev;
+        }
+        sess_flush(name, base_day + cur_day as i64, d_s, d_e, d_r, &mut sc.catsum, &mut sc.touched, cat_rank, users);
+
+        // credit: the latest click with s <= c <= s + WEEK (ties in ts: smallest click id)
+        let nc = cl.len();
+        let cp = cl.as_ptr();
+        let organic = cx.organic as usize;
+        let mut q = 0usize;
+        for i in 0..ns {
+            let st = *ss.add(i) as u64;
+            let lim = st + WEEK as u64;
+            while q < nc && (*cp.add(q)).ts as u64 <= lim {
+                q += 1;
+            }
+            let mut camp = organic;
+            if q > 0 {
+                let t = (*cp.add(q - 1)).ts;
+                if t as u64 >= st {
+                    let mut best = q - 1;
+                    let mut r = q - 1;
+                    while r > 0 && (*cp.add(r - 1)).ts == t {
+                        r -= 1;
+                        if cmp_key(cid_key((*cp.add(r)).cid, cx.ckey), cid_key((*cp.add(best)).cid, cx.ckey)) == Ordering::Less {
+                            best = r;
+                        }
+                    }
+                    camp = (*cp.add(best)).camp as usize;
+                }
+            }
+            let a = camp_out.get_unchecked_mut(camp * ndays + *sd.add(i) as usize);
+            a[0] += 1;
+            a[1] += *sp.add(i) as i64;
+            a[2] += *sr.add(i);
+        }
+        // assists: each campaign once per session among clicks with s <= c <= s + WEEK
+        if nc > 0 {
+            sc.pstamp += 1;
+            let pstamp = sc.pstamp;
+            if sc.s_nxt.len() < ns {
+                sc.s_nxt.resize(ns, 0);
+            }
+            let nx = sc.s_nxt.as_mut_ptr();
+            // nx[i]: first session after i on a later day (or ns)
+            *nx.add(ns - 1) = ns as u32;
+            for i in (0..ns - 1).rev() {
+                *nx.add(i) = if *sd.add(i + 1) != *sd.add(i) { (i + 1) as u32 } else { *nx.add(i + 1) };
+            }
+            let cov = sc.covered.as_mut_ptr();
+            let (mut lo, mut hi) = (0usize, 0usize);
+            for j in 0..nc {
+                let c = *cp.add(j);
+                let t = c.ts as u64;
+                while lo < ns && (*ss.add(lo) as u64 + WEEK as u64) < t {
+                    lo += 1;
+                }
+                if hi < lo {
+                    hi = lo;
+                }
+                while hi < ns && (*ss.add(hi) as u64) <= t {
+                    hi += 1;
+                }
+                let kc = c.camp as usize;
+                let cv = &mut *cov.add(kc);
+                let (from, newhi) = if cv.0 == pstamp { (lo.max(cv.1 as usize), hi.max(cv.1 as usize)) } else { (lo, hi) };
+                *cv = (pstamp, newhi as u32);
+                let row = camp_out.as_mut_ptr().add(kc * ndays);
+                let mut x = from;
+                while x < hi {
+                    let y = (*nx.add(x) as usize).min(hi);
+                    (*row.add(*sd.add(x) as usize))[3] += (y - x) as i64;
+                    x = y;
+                }
+            }
+        }
+    }
+}
+
+/// one (person, day) row: top category by summed price, ties to the smallest name
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn sess_flush(name: u64, day: i64, d_s: i64, d_e: i64, d_r: i64, catsum: &mut [i64], touched: &mut Vec<u16>, cat_rank: &[usize], users: &mut Vec<UserRow>) {
+    let mut top: Option<u16> = None;
+    if !touched.is_empty() {
+        let mut t = touched[0];
+        for &c in touched[1..].iter() {
+            let (v, tv) = (catsum[c as usize], catsum[t as usize]);
+            if v > tv || (v == tv && cat_rank[c as usize] < cat_rank[t as usize]) {
+                t = c;
+            }
+        }
+        top = Some(t);
+        for &c in touched.iter() {
+            catsum[c as usize] = 0;
+        }
+        touched.clear();
+    }
+    users.push(UserRow { person: name, day: day as i32, sessions: d_s, events: d_e, revenue: d_r, top });
+}
+
 // ---------- per-user processing ----------
 struct ClickQ {
     cks: Vec<C16>,
@@ -1125,6 +1302,7 @@ struct UserSc {
     plist: Vec<(u64, bool)>,
     pidx: Vec<u16>,
     cache: Vec<(u32, u16)>,
+    atab: Vec<(u32, u16)>,
     evbuf: Vec<UEv>,
     ckbuf: Vec<C16>,
 }
@@ -1160,25 +1338,50 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
     }
     us.plist.clear();
     us.pidx.clear();
+    // person index per uid of this block, direct-mapped by alias (every uid here has user index u)
+    if us.atab.len() != 512 {
+        us.atab = vec![(u32::MAX, 0); 512];
+    }
+    for &(a, _) in us.cache.iter() {
+        us.atab[(a & 511) as usize] = (u32::MAX, 0);
+    }
     us.cache.clear();
     let pers = sh.pers;
+    let atab = us.atab.as_mut_ptr();
     let look = |uid: u32, us_plist: &mut Vec<(u64, bool)>, cache: &mut Vec<(u32, u16)>| -> u16 {
-        for &(k, i) in cache.iter() {
-            if k == uid {
-                return i;
-            }
+        let ent = unsafe { &mut *atab.add((uid & 511) as usize) };
+        if ent.0 == uid {
+            return ent.1;
         }
-        look_slow(uid, us_plist, cache, pers)
+        let i = look_slow(uid, us_plist, cache, pers);
+        *ent = (uid, i);
+        i
     };
+    // one pass: does every event belong to the first person, and are the events in ts order?
     let mut multi = false;
-    let (mut lu, mut li) = (u32::MAX, 0u16);
-    for e in evs.iter() {
-        if e.uid != lu {
-            lu = e.uid;
-            li = look(e.uid, &mut us.plist, &mut us.cache);
+    let mut sorted0 = true;
+    {
+        let (mut lu, mut li) = (u32::MAX, 0u16);
+        let mut prev = 0u32;
+        for e in evs.iter() {
+            if e.uid != lu {
+                lu = e.uid;
+                li = look(e.uid, &mut us.plist, &mut us.cache);
+            }
+            multi |= li != 0;
+            sorted0 &= e.ts >= prev;
+            prev = e.ts;
         }
-        multi |= li != 0;
-        us.pidx.push(li);
+    }
+    if multi {
+        let (mut lu, mut li) = (u32::MAX, 0u16);
+        for e in evs.iter() {
+            if e.uid != lu {
+                lu = e.uid;
+                li = look(e.uid, &mut us.plist, &mut us.cache);
+            }
+            us.pidx.push(li);
+        }
     }
     if us.plist.len() > 30000 {
         // pathological: group through the side path instead
@@ -1200,7 +1403,7 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
         let (p, complex) = us.plist[pi];
         if complex {
             for (k, e) in evs.iter().enumerate() {
-                if us.pidx[k] as usize == pi {
+                if !multi || us.pidx[k] as usize == pi {
                     out.side.push((p, *e));
                 }
             }
@@ -1219,11 +1422,15 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
             &us.evbuf[..]
         };
         let mut sorted = true;
-        for w in ev.windows(2) {
-            if w[1].ts < w[0].ts {
-                sorted = false;
-                break;
+        if multi {
+            for w in ev.windows(2) {
+                if w[1].ts < w[0].ts {
+                    sorted = false;
+                    break;
+                }
             }
+        } else {
+            sorted = sorted0;
         }
         let ev: &[UEv] = if sorted {
             ev
@@ -1258,7 +1465,11 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
             &us.ckbuf[..]
         };
         let name = pers.name(p, sh.ukey);
-        sess_one(name, ev, cl, &sh.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+        if *K_S2 {
+            sess_two(name, ev, cl, &sh.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+        } else {
+            sess_one(name, ev, cl, &sh.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+        }
     }
 }
 
@@ -2609,6 +2820,9 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                     Some(mm) => {
                         let m = &mm[..];
                         let (s0, e0) = chunk_lines(m, c);
+                        if *K_POP {
+                            populate(m, s0, e0 + 128);
+                        }
                         if e0 + 128 <= m.len() {
                             (m, s0, e0)
                         } else {
@@ -2947,11 +3161,6 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 let mut pc = 0usize;
                 let span = 1usize << psh;
                 for vl in 0..span {
-                    // prefetch the record a few slots ahead (the gather is random within the partition)
-                    let ahead = unsafe { *slot.get_unchecked((vl + 12).min(span - 1)) };
-                    if ahead != 0 {
-                        prefetch(unsafe { parts.get_unchecked((ahead >> 26) as usize).as_ptr().add(((ahead & ((1 << 26) - 1)) - 1) as usize) });
-                    }
                     let sv = unsafe { *slot.get_unchecked(vl) };
                     if sv == 0 {
                         continue;
@@ -3138,7 +3347,11 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                     c2.extend(ck[a..bb].iter().map(|x| x.1));
                 }
                 let name = pers.name(p, ukey);
-                sess_one(name, e2, c2, &sh_r.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+                if *K_S2 {
+                    sess_two(name, e2, c2, &sh_r.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+                } else {
+                    sess_one(name, e2, c2, &sh_r.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+                }
                 i = j;
             }
         },
@@ -3917,4 +4130,93 @@ pub(crate) fn fuzz_ck(iters: usize) {
         }
     }
     eprintln!("FUZZCK: {iters} buffers, {lines} lines, {slow} slow, {fails} mismatching buffers");
+}
+
+/// SESSFUZZ=n: random persons through sess_one (reference) and sess_two; rows and campaign
+/// counters must match.
+pub(crate) fn fuzz_sess(iters: usize) {
+    let mut rng: u64 = 0xD1B5_4A32_D192_ED03 ^ iters as u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let ncat = 21usize;
+    let ncamp = 40usize;
+    let ndays = 16usize;
+    let cat_rank: Vec<usize> = (0..ncat).map(|i| (i * 7) % ncat).collect();
+    let mut fails = 0usize;
+    let mut sessions = 0usize;
+    let mk_sc = || SessSc { catsum: vec![0; ncat], covered: vec![(0, 0); ncamp + 1], ..Default::default() };
+    let (mut sa, mut sb) = (mk_sc(), mk_sc());
+    for it in 0..iters {
+        let ws = (20_000 + (next() % 3000) as i64) * DAY + if it % 5 == 0 { (next() % DAY as u64) as i64 } else { 0 };
+        let cws = ws - WEEK;
+        let cx = SessCx { ckey: next() & MASK40, ws, cws, ndays, organic: ncamp as u16, cat_rank: &cat_rank };
+        // events: clustered sessions with gaps around 30 minutes
+        let ne = 1 + (next() % 60) as usize;
+        let mut ev: Vec<UEv> = vec![];
+        let mut t: u64 = next() % (2 * DAY as u64);
+        for _ in 0..ne {
+            let g = match next() % 10 {
+                0 => GAP as u64,
+                1 => GAP as u64 + 1,
+                2 => 0,
+                3 => (next() % (3 * DAY as u64)),
+                4 => GAP as u64 - 1,
+                _ => next() % 600_000,
+            };
+            t += g;
+            if t >= 14 * DAY as u64 {
+                break;
+            }
+            let typ = [0u32, 0, 1, 2][(next() % 4) as usize];
+            let cat = (next() % ncat as u64) as u32;
+            ev.push(UEv { uid: 0, ts: t as u32, tc: typ | if typ == 2 { cat << 2 } else { 0 }, price: if typ == 2 { 1 + (next() % 5000) as u32 } else { 0 } });
+        }
+        if ev.is_empty() {
+            continue;
+        }
+        // clicks around session starts (ms since cws)
+        let nc = (next() % 25) as usize;
+        let mut cl: Vec<C16> = vec![];
+        for _ in 0..nc {
+            let base = ev[(next() % ev.len() as u64) as usize].ts as i64 + WEEK;
+            let d = match next() % 8 {
+                0 => 0,
+                1 => -WEEK,
+                2 => -WEEK - 1,
+                3 => 1,
+                4 => -((next() % WEEK as u64) as i64),
+                5 => -((next() % (3 * DAY as u64)) as i64),
+                _ => (next() % (2 * DAY as u64)) as i64 - DAY,
+            };
+            let ts = (base + d).clamp(0, 21 * DAY - 1) as u32;
+            cl.push(C16 { cid: (next() % 50) as u32, uid: 0, ts, camp: (next() % ncamp as u64) as u32 });
+            if next() % 4 == 0 {
+                cl.push(C16 { cid: (next() % 50) as u32, uid: 0, ts, camp: (next() % ncamp as u64) as u32 });
+            }
+        }
+        cl.sort_by_key(|c| c.ts);
+        let (mut ua, mut ub): (Vec<UserRow>, Vec<UserRow>) = (vec![], vec![]);
+        let mut ca = vec![[0i64; 4]; (ncamp + 1) * ndays];
+        let mut cb = vec![[0i64; 4]; (ncamp + 1) * ndays];
+        sess_one(7, &ev, &cl, &cx, &mut sa, &mut ua, &mut ca);
+        sess_two(7, &ev, &cl, &cx, &mut sb, &mut ub, &mut cb);
+        let rk = |r: &UserRow| (r.person, r.day, r.sessions, r.events, r.revenue, r.top);
+        sessions += ua.iter().map(|r| r.sessions as usize).sum::<usize>();
+        if ua.len() != ub.len() || ua.iter().zip(&ub).any(|(x, y)| rk(x) != rk(y)) || ca != cb {
+            fails += 1;
+            if fails <= 3 {
+                eprintln!("MISMATCH it {it}: rows {:?} vs {:?}", ua.iter().map(rk).collect::<Vec<_>>(), ub.iter().map(rk).collect::<Vec<_>>());
+                for (i, (x, y)) in ca.iter().zip(&cb).enumerate() {
+                    if x != y {
+                        eprintln!("  camp {} day {}: {:?} vs {:?}", i / ndays, i % ndays, x, y);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("SESSFUZZ: {iters} persons, {sessions} sessions, {fails} mismatches");
 }
