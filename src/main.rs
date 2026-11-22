@@ -1632,7 +1632,111 @@ fn fuzz_rows() {
     eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
 }
 
+fn probe13() {
+    let t0 = std::time::Instant::now();
+    let mkdata = |g: &str, ev: &str, ck: &str| {
+        let _ = std::fs::remove_dir_all(g);
+        let tg = std::time::Instant::now();
+        let st = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", ev, "--clicks", ck, "--output", g])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        eprintln!("P13 gen {ev} ok={:?} {:.1}s", st.map(|s| s.success()), tg.elapsed().as_secs_f64());
+    };
+    let run = |g: &str, env: &[(&str, &str)]| -> (f64, String) {
+        let _ = std::fs::remove_dir_all("/scratch/o");
+        let t = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/app/sess");
+        cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o").env("NCPU", "8");
+        for (k, v) in env { cmd.env(k, v); }
+        let out = cmd.output();
+        let wall = t.elapsed().as_secs_f64();
+        let mut d: Vec<String> = vec![];
+        let mut prev = 0.0;
+        if let Ok(o) = out {
+            for l in String::from_utf8_lossy(&o.stderr).lines() {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                if let Some(i) = w.iter().position(|x| *x == "wall") {
+                    let x = w.get(i + 1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(-1.0);
+                    let sy = w.get(i + 5).map(|x| x.trim_start_matches('+')).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                    d.push(format!("{:.0}{}", (x - prev) * 1000.0, if sy >= 0.05 { format!("s{:.1}", sy) } else { String::new() }));
+                    prev = x;
+                }
+                if l.contains("declined") { d.push("DECLINED".into()); }
+            }
+        }
+        (wall, d.join("/"))
+    };
+    let st = |v: &mut Vec<f64>| -> String { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); format!("{:.3}/{:.3}", v[0], v[v.len() / 2]) };
+    mkdata("/scratch/g20", "20000000", "5000000");
+    let g = "/scratch/g20";
+    let pv: [(&str, &[(&str, &str)]); 4] = [
+        ("base", &[]),
+        ("k4", &[("SESS_VAR", "192")]),
+        ("ev3", &[("SESS_VAR", "168")]),
+        ("map", &[("SESS_MAP2", "1")]),
+    ];
+    let mut pt: Vec<Vec<f64>> = vec![vec![]; pv.len()];
+    for _ in 0..3 {
+        for (i, (_, env)) in pv.iter().enumerate() {
+            let mut e: Vec<(&str, &str)> = env.to_vec();
+            e.push(("FAST_PARSEONLY", "1"));
+            pt[i].push(run(g, &e).0);
+        }
+    }
+    let mut line = String::from("P13 parse min/med:");
+    for (i, (n, _)) in pv.iter().enumerate() {
+        line += &format!(" {n}={}", st(&mut pt[i]));
+    }
+    eprintln!("{line}");
+    let cfgs: [(&str, &[(&str, &str)]); 6] = [
+        ("base", &[]),
+        ("k4", &[("SESS_VAR", "192")]),
+        ("map", &[("SESS_MAP2", "1")]),
+        ("s1", &[("SESS_S2", "0")]),
+        ("psh14", &[("SESS_PSH", "14")]),
+        ("nt7", &[("NCPU", "7")]),
+    ];
+    let mut ft: Vec<Vec<f64>> = vec![vec![]; cfgs.len()];
+    let mut last: Vec<String> = vec![String::new(); cfgs.len()];
+    for _ in 0..3 {
+        for (i, (_, env)) in cfgs.iter().enumerate() {
+            let (w, d) = run(g, env);
+            ft[i].push(w);
+            last[i] = d;
+        }
+    }
+    for (i, (name, _)) in cfgs.iter().enumerate() {
+        eprintln!("P13 20M {name} {} [{}]", st(&mut ft[i]), last[i]);
+    }
+    let _ = std::fs::remove_dir_all(g);
+    mkdata("/scratch/g60", "60000000", "15000000");
+    let g = "/scratch/g60";
+    let cfgs: [(&str, &[(&str, &str)]); 5] = [
+        ("base", &[]),
+        ("psh15", &[("SESS_PSH", "15")]),
+        ("psh16", &[("SESS_PSH", "16")]),
+        ("k4", &[("SESS_VAR", "192")]),
+        ("map", &[("SESS_MAP2", "1")]),
+    ];
+    let mut ft: Vec<Vec<f64>> = vec![vec![]; cfgs.len()];
+    let mut last: Vec<String> = vec![String::new(); cfgs.len()];
+    for _ in 0..2 {
+        for (i, (_, env)) in cfgs.iter().enumerate() {
+            let (w, d) = run(g, env);
+            ft[i].push(w);
+            last[i] = d;
+        }
+    }
+    for (i, (name, _)) in cfgs.iter().enumerate() {
+        eprintln!("P13 60M {name} {} [{}]", st(&mut ft[i]), last[i]);
+    }
+    eprintln!("P13 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::env::var_os("SESS_NO_DISPATCH").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe13();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
