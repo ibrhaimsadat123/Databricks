@@ -1457,7 +1457,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 buf: vec![],
                 wc: if *K_VAR & 8 == 0 { Wc::new_n(nparts, cap, nparts) } else { Wc::empty() },
                 wc8: if *K_VAR & 8 != 0 { Wc::new_n(nparts, cap, nparts) } else { Wc::empty() },
-                purs: (0..nparts).map(|_| Vec::new()).collect(),
+                purs: (0..nparts).map(|_| Vec::with_capacity(((1usize << psh) / 25) / nt + 8)).collect(),
                 sparse: vec![],
                 wck: Wc::new_n(NCQ, cap_ck, ncq_used),
                 spck: vec![],
@@ -1486,6 +1486,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                             let wc = &mut st.wc;
                             match var & 23 {
                                 16 => parse_ev::<16, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                18 => parse_ev::<64, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 17 => parse_ev::<17, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 0 => parse_ev::<0, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 1 => parse_ev::<1, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
