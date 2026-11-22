@@ -2175,6 +2175,7 @@ fn parse_ev3<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mu
 fn parse_ev4<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) -> usize {
     assert!(buf.len() >= e + 128);
     let mut nslow = 0usize;
+    let mut mp = *maxp;
     unsafe {
         let base = buf.as_ptr();
         let (ws, we, ukey, ekey, vb, psh, vmask) = (cx.ws, cx.we, cx.ukey, cx.ekey, cx.vb, cx.psh, cx.vmask);
@@ -2394,14 +2395,17 @@ fn parse_ev4<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mu
                 if typ == 2 {
                     purs.get_unchecked_mut(p).push(PRec { v_low: vl, price: pr, cat });
                 }
-                *maxp = (*maxp).max(p);
+                mp = mp.max(p);
                 ls += l + 1;
                 continue 'line;
             }
             nslow += 1;
+            *maxp = (*maxp).max(mp);
             ls = ev_slow::<K>(buf, ls, e, cx, wc, purs, sparse, maxp);
+            mp = mp.max(*maxp);
         }
     }
+    *maxp = (*maxp).max(mp);
     nslow
 }
 
@@ -3451,11 +3455,20 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     }
     drop(link_slots);
     // unmap the inputs on several threads (one serial teardown at exit otherwise)
-    std::thread::scope(|sc| {
-        for m in maps.drain(..).flatten() {
-            sc.spawn(move || drop(m));
+    {
+        // nt threads, each unmapping every nt-th file
+        let mut groups: Vec<Vec<memmap2::Mmap>> = (0..nt).map(|_| vec![]).collect();
+        for (i, m) in maps.drain(..).flatten().enumerate() {
+            groups[i % nt].push(m);
         }
-    });
+        std::thread::scope(|sc| {
+            for g in groups {
+                if !g.is_empty() {
+                    sc.spawn(move || drop(g));
+                }
+            }
+        });
+    }
     if std::env::var("FAST_PARSEONLY").is_ok() {
         std::process::exit(0);
     }
