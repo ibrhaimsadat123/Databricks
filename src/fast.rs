@@ -707,20 +707,45 @@ impl P32 {
     }
 }
 
+/// alias slots per user in the direct person table
+const AS: u32 = 8;
+
 struct Persons {
+    /// uid number n with alias (n & 511) < AS and user (n >> 9) < du: dtab[user * AS + alias] = class
+    dtab: Vec<u32>,
+    du: u32,
+    /// other linked uid numbers -> class
     ptab: P32,
     spec_class: FxHashMap<u32, u32>,
     cname: Vec<u64>,
     cuser: Vec<u32>,
 }
 impl Persons {
+    #[inline(always)]
+    fn class_of(&self, u: u32) -> u32 {
+        let (user, alias) = (u >> 9, u & 511);
+        if alias < AS && user < self.du {
+            unsafe { *self.dtab.get_unchecked((user * AS + alias) as usize) }
+        } else {
+            self.ptab.get(u).unwrap_or(u32::MAX)
+        }
+    }
+    #[inline(always)]
+    fn prefetch(&self, u: u32) {
+        let (user, alias) = (u >> 9, u & 511);
+        if alias < AS && user < self.du {
+            prefetch(unsafe { self.dtab.as_ptr().add((user * AS + alias) as usize) });
+        }
+    }
     /// (person, complex)
     #[inline(always)]
     fn of(&self, u: u32) -> (u64, bool) {
         if u & SPECIAL == 0 {
-            match self.ptab.get(u) {
-                Some(c) => (CLASS_TAG | c as u64, unsafe { *self.cuser.get_unchecked(c as usize) } == NOUSER),
-                None => (u as u64, false),
+            let c = self.class_of(u);
+            if c != u32::MAX {
+                (CLASS_TAG | c as u64, unsafe { *self.cuser.get_unchecked(c as usize) } == NOUSER)
+            } else {
+                (u as u64, false)
             }
         } else {
             match self.spec_class.get(&(u & !SPECIAL)) {
@@ -738,6 +763,107 @@ impl Persons {
             uid_key(p as u32, ukey)
         }
     }
+}
+
+/// Union-find over link IDs with a direct table for (user, alias < AS) IDs and a hash map
+/// for the rest; same classes, names and per-class user as build_persons.
+fn build_persons2(lparts: &[(Vec<u8>, Vec<(u64, u64, u64, u64)>)]) -> Persons {
+    let direct = |id: u64| -> bool { id & SPEC_TAG == 0 && ((id & 511) as u32) < AS };
+    let mut maxu = 0u64;
+    for s in lparts {
+        for &(a, _, b, _) in &s.1 {
+            if direct(a) {
+                maxu = maxu.max(a >> 9);
+            }
+            if direct(b) {
+                maxu = maxu.max(b >> 9);
+            }
+        }
+    }
+    let du = (maxu + 1).min(1 << 22) as u32;
+    let nd = (du * AS) as usize;
+    let n_l: usize = lparts.iter().map(|s| s.1.len()).sum();
+    let mut parent: Vec<u32> = vec![u32::MAX; nd];
+    let mut names: Vec<u64> = vec![0; nd];
+    let mut over: FxHashMap<u64, u32> = FxHashMap::default();
+    let mut over_ids: Vec<u64> = vec![];
+    fn find(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            let gp = p[p[x as usize] as usize];
+            p[x as usize] = gp;
+            x = gp;
+        }
+        x
+    }
+    let _ = n_l;
+    for s in lparts {
+        for &(a, ka, b, kb) in &s.1 {
+            let mut ix = |id: u64, k: u64, parent: &mut Vec<u32>, names: &mut Vec<u64>| -> u32 {
+                let i = if direct(id) && (id >> 9) < du as u64 {
+                    ((id >> 9) as u32) * AS + (id & 511) as u32
+                } else {
+                    match over.get(&id) {
+                        Some(&i) => i,
+                        None => {
+                            let i = parent.len() as u32;
+                            parent.push(u32::MAX);
+                            names.push(0);
+                            over.insert(id, i);
+                            over_ids.push(id);
+                            i
+                        }
+                    }
+                };
+                if parent[i as usize] == u32::MAX {
+                    parent[i as usize] = i;
+                    names[i as usize] = k;
+                }
+                i
+            };
+            let ia = ix(a, ka, &mut parent, &mut names);
+            let ib = ix(b, kb, &mut parent, &mut names);
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            if ra != rb {
+                parent[ra as usize] = rb;
+            }
+        }
+    }
+    let n = parent.len();
+    let mut cls = vec![u32::MAX; n];
+    let mut cname: Vec<u64> = vec![];
+    let mut cuser: Vec<u32> = vec![];
+    let mut dtab: Vec<u32> = vec![u32::MAX; nd];
+    let mut ptab = P32::new(over_ids.len().max(16));
+    let mut spec_class: FxHashMap<u32, u32> = FxHashMap::default();
+    for i in 0..n {
+        if parent[i] == u32::MAX {
+            continue;
+        }
+        let r = find(&mut parent, i as u32) as usize;
+        let id = if i < nd { (((i as u32) / AS) as u64) << 9 | ((i as u32) % AS) as u64 } else { over_ids[i - nd] };
+        let u = if id & SPEC_TAG != 0 { NOUSER } else { (id >> 9) as u32 };
+        if cls[r] == u32::MAX {
+            cls[r] = cname.len() as u32;
+            cname.push(names[i]);
+            cuser.push(u);
+        }
+        let c = cls[r] as usize;
+        if cmp_key(names[i], cname[c]) == Ordering::Less {
+            cname[c] = names[i];
+        }
+        if cuser[c] != u {
+            cuser[c] = NOUSER;
+        }
+        if i < nd {
+            dtab[i] = c as u32;
+        } else if id & SPEC_TAG != 0 {
+            spec_class.insert((id & !SPEC_TAG) as u32, c as u32);
+        } else {
+            ptab.insert(id as u32, c as u32);
+        }
+    }
+    Persons { dtab, du, ptab, spec_class, cname, cuser }
 }
 
 /// link ID -> (id, name key): id is the uid number (< 2^31) or SPEC_TAG | special index
@@ -811,7 +937,7 @@ fn build_persons(lparts: &[(Vec<u8>, Vec<(u64, u64, u64, u64)>)]) -> Persons {
             ptab.insert(ids[i] as u32, c as u32);
         }
     }
-    Persons { ptab, spec_class, cname, cuser }
+    Persons { dtab: vec![], du: 0, ptab, spec_class, cname, cuser }
 }
 
 // ---------- sessions for one person ----------
@@ -1534,7 +1660,14 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let evcx = &EvCtx { ws, we, ukey, ekey, vb, psh, vmask, evwin, evloc, ingtab, products, unknown_cat };
     let (pers, sa) = std::thread::scope(|scope| {
         let lparts = &lparts;
-        let uf = scope.spawn(move || build_persons(lparts));
+        let uf = scope.spawn(move || {
+            let t = std::time::Instant::now();
+            let r = if std::env::var_os("SESS_UF1").is_some() { build_persons(lparts) } else { build_persons2(lparts) };
+            if std::env::var_os("VERBOSE").is_some() {
+                eprintln!("union-find {:.3}s classes {}", t.elapsed().as_secs_f64(), r.cname.len());
+            }
+            r
+        });
         let sa = run(
             nt,
             chunks.len(),
@@ -1687,7 +1820,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 let v = &s.ck[q];
                 for (j, c) in v.iter().enumerate() {
                     if j + 8 < v.len() {
-                        pers.ptab.prefetch(v[j + 8].uid);
+                        pers.prefetch(v[j + 8].uid);
                     }
                     let (p, complex) = pers.of(c.uid);
                     cplx.push(complex);
@@ -1878,7 +2011,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                     }
                     let u = r.uid >> 9;
                     if u != cur_user {
-                        pers.ptab.prefetch(r.uid);
+                        pers.prefetch(r.uid);
                         if cur_user != NOUSER {
                             if u < cur_user {
                                 st.bad = true;
