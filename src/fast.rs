@@ -2405,7 +2405,7 @@ struct CkCtx<'a> {
 
 /// One click row (fields already unquoted): the reference semantics.
 #[inline(always)]
-fn ck_row(f: [&[u8]; 4], cx: &CkCtx, wck: &mut Wc<C16, 4>, spck: &mut Vec<C16>) {
+fn ck_row(f: [&[u8]; 4], cx: &CkCtx, wck: &mut Wc<C16, 8>, spck: &mut Vec<C16>) {
     let [cid, uid, camp, ts] = f;
     if cid.is_empty() || uid.is_empty() {
         return;
@@ -2426,7 +2426,7 @@ fn ck_row(f: [&[u8]; 4], cx: &CkCtx, wck: &mut Wc<C16, 4>, spck: &mut Vec<C16>) 
 
 #[cold]
 #[inline(never)]
-fn ck_slow(buf: &[u8], ls: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 4>, spck: &mut Vec<C16>) -> usize {
+fn ck_slow(buf: &[u8], ls: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 8>, spck: &mut Vec<C16>) -> usize {
     let next = match memchr(b'\n', &buf[ls..e]) {
         Some(j) => ls + j + 1,
         None => e,
@@ -2439,7 +2439,7 @@ fn ck_slow(buf: &[u8], ls: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 4>, sp
 /// fast path when it ends within 64 bytes, has three commas, valid quoting, canonical click and
 /// user IDs and a ts of 13 digits or 20/25 bytes ending in Z/sign. Returns the slow line count.
 #[inline(never)]
-fn parse_ck2(buf: &[u8], s: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 4>, spck: &mut Vec<C16>) -> usize {
+fn parse_ck2(buf: &[u8], s: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 8>, spck: &mut Vec<C16>) -> usize {
     assert!(buf.len() >= e + 128);
     let mut nslow = 0usize;
     unsafe {
@@ -2577,7 +2577,28 @@ fn parse_ck2(buf: &[u8], s: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 4>, s
                     (t12, ok12)
                 };
                 if okt & (tr >= 0) & (tr < we_r) {
-                    if let Some(ci) = cx.campaigns.get_fast(std::slice::from_raw_parts(pg, ng)) {
+                    // "c_" and 1..4 digits, canonical: the number indexes the table directly (what
+                    // IdTable::get does for canonical numbers); anything else goes through get_fast
+                    let k = ng.wrapping_sub(2);
+                    let raw = std::ptr::read_unaligned(pg.add(2) as *const u32) as u64;
+                    let ci = if (k.wrapping_sub(1) < 4) & (std::ptr::read_unaligned(pg as *const u16) == u16::from_le_bytes(*b"c_")) & !((k > 1) & ((raw & 0xFF) == 0x30)) {
+                        let sh = 8 * (4 - k) as u32;
+                        let y = ((raw << sh) & 0xFFFF_FFFF) | (0x3030_3030u64 & ((1u64 << sh) - 1));
+                        let d = y.wrapping_sub(0x3030_3030);
+                        if ((d.wrapping_add(0x7676_7676) | d) & 0x8080_8080) == 0 {
+                            let t = (d & 0x00FF_00FF) * 10 + ((d >> 8) & 0x00FF_00FF);
+                            let v = (t & 0xFFFF) * 100 + (t >> 16);
+                            match cx.campaigns.arr.get(v as usize) {
+                                Some(&r) if r != NONE16 => Some(r),
+                                _ => None,
+                            }
+                        } else {
+                            cx.campaigns.get_fast(std::slice::from_raw_parts(pg, ng))
+                        }
+                    } else {
+                        cx.campaigns.get_fast(std::slice::from_raw_parts(pg, ng))
+                    };
+                    if let Some(ci) = ci {
                         wck.push(((un as u32 >> 9) >> CSH) as usize, C16 { cid: cn as u32, uid: un as u32, ts: tr as u32, camp: ci as u32 });
                     }
                 }
@@ -3261,7 +3282,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         wc8: Wc<DRec, 8>,
         purs: Vec<Vec<PRec>>,
         sparse: Vec<SRec>,
-        wck: Wc<C16, 4>,
+        wck: Wc<C16, 8>,
         spck: Vec<C16>,
         ev: Vec<Vec<DRec>>,
         ck: Vec<Vec<C16>>,
@@ -4641,8 +4662,8 @@ pub(crate) fn fuzz_ck(iters: usize) {
             buf.push([b'\n', b',', b'"', b'a', b'7'][(next() % 5) as usize]);
         }
         lines += nl;
-        let mut wa: Wc<C16, 4> = Wc::new_n(NCQ, 16, NCQ);
-        let mut wb: Wc<C16, 4> = Wc::new_n(NCQ, 16, NCQ);
+        let mut wa: Wc<C16, 8> = Wc::new_n(NCQ, 16, NCQ);
+        let mut wb: Wc<C16, 8> = Wc::new_n(NCQ, 16, NCQ);
         let (mut sa, mut sb): (Vec<C16>, Vec<C16>) = (vec![], vec![]);
         for_rows_fast_v::<4, 0>(&buf, 0, e, |f| ck_row(f, &cx, &mut wa, &mut sa));
         slow += parse_ck2(&buf, 0, e, &cx, &mut wb, &mut sb);
@@ -4658,8 +4679,8 @@ pub(crate) fn fuzz_ck(iters: usize) {
                     one.push(b'\n');
                     let ee = one.len();
                     one.extend_from_slice(&[0u8; 160]);
-                    let mut w1: Wc<C16, 4> = Wc::new_n(NCQ, 4, NCQ);
-                    let mut w2: Wc<C16, 4> = Wc::new_n(NCQ, 4, NCQ);
+                    let mut w1: Wc<C16, 8> = Wc::new_n(NCQ, 4, NCQ);
+                    let mut w2: Wc<C16, 8> = Wc::new_n(NCQ, 4, NCQ);
                     let (mut s1, mut s2): (Vec<C16>, Vec<C16>) = (vec![], vec![]);
                     for_rows_fast_v::<4, 0>(&one, 0, ee, |f| ck_row(f, &cx, &mut w1, &mut s1));
                     parse_ck2(&one, 0, ee, &cx, &mut w2, &mut s2);
