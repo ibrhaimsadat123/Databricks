@@ -1303,6 +1303,7 @@ struct UserSc {
     pidx: Vec<u16>,
     cache: Vec<(u32, u16)>,
     atab: Vec<(u32, u16)>,
+    evtmp: Vec<UEv>,
     evbuf: Vec<UEv>,
     ckbuf: Vec<C16>,
 }
@@ -1442,6 +1443,157 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
                 evs.sort_by_key(|e| e.ts);
                 &evs[..]
             }
+        };
+        // clicks of this person
+        let mut all = true;
+        for c in cks {
+            let i = look(c.uid, &mut us.plist, &mut us.cache);
+            if i as usize != pi {
+                all = false;
+                break;
+            }
+        }
+        let cl: &[C16] = if all {
+            cks
+        } else {
+            us.ckbuf.clear();
+            for c in cks {
+                let i = look(c.uid, &mut us.plist, &mut us.cache);
+                if i as usize == pi {
+                    us.ckbuf.push(*c);
+                }
+            }
+            &us.ckbuf[..]
+        };
+        let name = pers.name(p, sh.ukey);
+        if *K_S2 {
+            sess_two(name, ev, cl, &sh.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+        } else {
+            sess_one(name, ev, cl, &sh.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+        }
+    }
+}
+
+/// finish_user for events in a borrowed slice: the common case (no sparse events, in ts order
+/// when one person) runs without copying; the rest goes through finish_user on a copy.
+fn finish_user_s(u: u32, evs: &[UEv], sh: &Shared, us: &mut UserSc, out: &mut Out) {
+    if (sh.sparse_bits[(u >> 6) as usize] >> (u & 63)) & 1 != 0 {
+        let mut v = std::mem::take(&mut us.evtmp);
+        v.clear();
+        v.extend_from_slice(evs);
+        finish_user(u, &mut v, sh, us, out);
+        us.evtmp = v;
+        return;
+    }
+    us.plist.clear();
+    us.pidx.clear();
+    // person index per uid of this block, direct-mapped by alias (every uid here has user index u)
+    if us.atab.len() != 512 {
+        us.atab = vec![(u32::MAX, 0); 512];
+    }
+    for &(a, _) in us.cache.iter() {
+        us.atab[(a & 511) as usize] = (u32::MAX, 0);
+    }
+    us.cache.clear();
+    let pers = sh.pers;
+    let atab = us.atab.as_mut_ptr();
+    let look = |uid: u32, us_plist: &mut Vec<(u64, bool)>, cache: &mut Vec<(u32, u16)>| -> u16 {
+        let ent = unsafe { &mut *atab.add((uid & 511) as usize) };
+        if ent.0 == uid {
+            return ent.1;
+        }
+        let i = look_slow(uid, us_plist, cache, pers);
+        *ent = (uid, i);
+        i
+    };
+    // one pass: does every event belong to the first person, and are the events in ts order?
+    let mut multi = false;
+    let mut sorted0 = true;
+    {
+        let (mut lu, mut li) = (u32::MAX, 0u16);
+        let mut prev = 0u32;
+        for e in evs.iter() {
+            if e.uid != lu {
+                lu = e.uid;
+                li = look(e.uid, &mut us.plist, &mut us.cache);
+            }
+            multi |= li != 0;
+            sorted0 &= e.ts >= prev;
+            prev = e.ts;
+        }
+    }
+    if !multi && !sorted0 {
+        let mut v = std::mem::take(&mut us.evtmp);
+        v.clear();
+        v.extend_from_slice(evs);
+        finish_user(u, &mut v, sh, us, out);
+        us.evtmp = v;
+        return;
+    }
+    if multi {
+        let (mut lu, mut li) = (u32::MAX, 0u16);
+        for e in evs.iter() {
+            if e.uid != lu {
+                lu = e.uid;
+                li = look(e.uid, &mut us.plist, &mut us.cache);
+            }
+            us.pidx.push(li);
+        }
+    }
+    if us.plist.len() > 30000 {
+        // pathological: group through the side path instead
+        for e in evs.iter() {
+            out.side.push((pers.of(e.uid).0, *e));
+        }
+        return;
+    }
+    let q = (u >> CSH) as usize;
+    let lu = (u & ((1 << CSH) - 1)) as usize;
+    let cks: &[C16] = if q < sh.cq.len() {
+        let c = &sh.cq[q];
+        if c.ofs.is_empty() { &[] } else { &c.cks[c.ofs[lu] as usize..c.ofs[lu + 1] as usize] }
+    } else {
+        &[]
+    };
+    let np = us.plist.len();
+    for pi in 0..np {
+        let (p, complex) = us.plist[pi];
+        if complex {
+            for (k, e) in evs.iter().enumerate() {
+                if !multi || us.pidx[k] as usize == pi {
+                    out.side.push((p, *e));
+                }
+            }
+            continue;
+        }
+        // events of this person
+        let ev: &[UEv] = if !multi {
+            &evs[..]
+        } else {
+            us.evbuf.clear();
+            for (k, e) in evs.iter().enumerate() {
+                if us.pidx[k] as usize == pi {
+                    us.evbuf.push(*e);
+                }
+            }
+            &us.evbuf[..]
+        };
+        let mut sorted = true;
+        if multi {
+            for w in ev.windows(2) {
+                if w[1].ts < w[0].ts {
+                    sorted = false;
+                    break;
+                }
+            }
+        } else {
+            sorted = sorted0;
+        }
+        let ev: &[UEv] = if sorted {
+            ev
+        } else {
+            us.evbuf.sort_by_key(|e| e.ts);
+            &us.evbuf[..]
         };
         // clicks of this person
         let mut all = true;
@@ -2511,6 +2663,8 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     if std::env::var("SESS_SLOW").is_ok() {
         return Err("forced".into());
     }
+    // slot codes keep the producing thread in 6 bits
+    let nt = nt.clamp(1, 64);
     let manifest = String::from_utf8_lossy(&read_small(&data.join("manifest.json"))).to_string();
     let ws = manifest_time(&manifest, "window_start");
     let we = manifest_time(&manifest, "window_end");
@@ -3060,32 +3214,49 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     // after it belong to different users). Only an efficiency heuristic: users that do straddle a
     // boundary are still merged across segments below.
     let bounds: Vec<usize> = {
-        let edge = |p: usize, want_max: bool| -> u32 {
-            let mut best: Option<(u32, u32)> = None;
-            for x in sa.iter() {
-                for r in &x.ev[p] {
-                    if (r.meta >> 22) & 3 == 3 || r.uid & SPECIAL != 0 {
-                        continue;
+        // per partition, in parallel: users of the valid records with the smallest and largest
+        // index (one scan of every record instead of repeated serial scans per candidate boundary)
+        // SESS_NUDGE=1: move boundaries off users that seem to straddle them (one scan of every
+        // record); by default nominal boundaries, straddling users are merged below anyway
+        let nudge = knob("SESS_NUDGE", 0) != 0;
+        let edges: Vec<(u32, u32)> = if !nudge {
+            vec![]
+        } else {
+            run_map(
+                nt,
+                np,
+                |_| (),
+                |_, p| {
+                    let (mut lo, mut lo_u, mut hi, mut hi_u) = (u32::MAX, NOUSER, 0u32, NOUSER);
+                    for x in sa.iter() {
+                        for r in &x.ev[p] {
+                            if (r.meta >> 22) & 3 == 3 || r.uid & SPECIAL != 0 {
+                                continue;
+                            }
+                            let vl = r.meta & vmask;
+                            if vl < lo {
+                                lo = vl;
+                                lo_u = r.uid >> 9;
+                            }
+                            if hi_u == NOUSER || vl > hi {
+                                hi = vl;
+                                hi_u = r.uid >> 9;
+                            }
+                        }
                     }
-                    let vl = r.meta & vmask;
-                    let better = match best {
-                        None => true,
-                        Some((bv, _)) => if want_max { vl > bv } else { vl < bv },
-                    };
-                    if better {
-                        best = Some((vl, r.uid >> 9));
-                    }
-                }
-            }
-            best.map(|b| b.1).unwrap_or(NOUSER)
+                    (lo_u, hi_u)
+                },
+            )
+            .1
         };
+        let edge = |p: usize, want_max: bool| -> u32 { if want_max { edges[p].1 } else { edges[p].0 } };
         let mut b = vec![0usize; nseg + 1];
         b[nseg] = np;
         for si in 1..nseg {
             let nominal = si * np / nseg;
             let mut q = nominal.max(b[si - 1] + 1);
             let limit = (q + np / nseg).min(np - 1);
-            while q < limit {
+            while nudge && q < limit {
                 let a = edge(q - 1, true);
                 let c = edge(q, false);
                 if a != c || a == NOUSER {
@@ -3108,6 +3279,8 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         slot: Vec<u32>,
         pbuf: Vec<PRec>,
         cur: Vec<UEv>,
+        blk: Vec<UEv>,
+        bnd: Vec<(u32, u32)>,
         us: UserSc,
         out: Out,
         pieces: Vec<(usize, u8, u32, Vec<UEv>)>,
@@ -3125,7 +3298,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let sb = run(
         nt,
         nseg,
-        |_| SB { slot: vec![0u32; 1 << psh], pbuf: vec![], cur: vec![], us: new_us(), out: new_out(), pieces: vec![], meta: vec![], bad: false },
+        |_| SB { slot: vec![0u32; 1 << psh], pbuf: vec![], cur: vec![], blk: vec![], bnd: vec![], us: new_us(), out: new_out(), pieces: vec![], meta: vec![], bad: false },
         |st, s| {
             if st.bad {
                 return;
@@ -3158,53 +3331,85 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                     st.pbuf.extend_from_slice(&x.purs[p]);
                 }
                 st.pbuf.sort_unstable_by_key(|r| r.v_low);
-                let mut pc = 0usize;
+                st.pbuf.push(PRec { v_low: u32::MAX, price: 0, cat: 0 });
                 let span = 1usize << psh;
-                for vl in 0..span {
-                    let sv = unsafe { *slot.get_unchecked(vl) };
-                    if sv == 0 {
-                        continue;
+                // gather the surviving events in index order into cur, noting where users start;
+                // no calls in this loop (blocks are finished afterwards)
+                let need: usize = parts.iter().map(|x| x.len()).sum();
+                st.cur.reserve(need);
+                st.bnd.clear();
+                let open_user = cur_user;
+                unsafe {
+                    let w0 = st.cur.as_mut_ptr();
+                    let mut w = w0.add(st.cur.len());
+                    let slotp = st.slot.as_mut_ptr();
+                    let pb = st.pbuf.as_ptr();
+                    let mut pc = 0usize;
+                    let mut bases = [std::ptr::null::<DRec>(); 64];
+                    for (ti, sl) in parts.iter().enumerate() {
+                        bases[ti] = sl.as_ptr();
                     }
-                    unsafe { *slot.get_unchecked_mut(vl) = 0 };
-                    let r = unsafe { *parts.get_unchecked((sv >> 26) as usize).get_unchecked(((sv & ((1 << 26) - 1)) - 1) as usize) };
-                    let typ = (r.meta >> 22) & 3;
-                    if typ == 3 {
-                        continue;
-                    }
-                    let mut e = UEv { uid: r.uid, ts: r.ts, tc: typ, price: 0 };
-                    if typ == 2 {
-                        while st.pbuf[pc].v_low < vl as u32 {
-                            pc += 1;
+                    for vl in 0..span {
+                        let sv = *slotp.add(vl);
+                        if sv == 0 {
+                            continue;
                         }
-                        let pr = st.pbuf[pc];
-                        e.price = pr.price;
-                        e.tc |= pr.cat << 2;
-                    }
-                    if r.uid & SPECIAL != 0 {
-                        st.out.side.push((pers.of(r.uid).0, e));
-                        continue;
-                    }
-                    let u = r.uid >> 9;
-                    if u != cur_user {
-                        pers.prefetch(r.uid);
-                        if cur_user != NOUSER {
-                            if u < cur_user {
+                        *slotp.add(vl) = 0;
+                        let r = *bases.get_unchecked((sv >> 26) as usize).add(((sv & ((1 << 26) - 1)) - 1) as usize);
+                        let typ = (r.meta >> 22) & 3;
+                        if typ == 3 {
+                            continue;
+                        }
+                        let mut e = UEv { uid: r.uid, ts: r.ts, tc: typ, price: 0 };
+                        if typ == 2 {
+                            while (*pb.add(pc)).v_low < vl as u32 {
+                                pc += 1;
+                            }
+                            let pr = *pb.add(pc);
+                            e.price = pr.price;
+                            e.tc |= pr.cat << 2;
+                        }
+                        if r.uid & SPECIAL != 0 {
+                            st.out.side.push((pers.of(r.uid).0, e));
+                            continue;
+                        }
+                        let u = r.uid >> 9;
+                        if u != cur_user {
+                            if cur_user != NOUSER && u < cur_user {
                                 st.bad = true;
                                 return;
                             }
-                            if in_head {
-                                st.pieces.push((s, 0, cur_user, std::mem::take(&mut st.cur)));
-                                in_head = false;
-                            } else {
-                                finish_user(cur_user, &mut st.cur, sh_r, &mut st.us, &mut st.out);
-                                st.cur.clear();
+                            if cur_user == NOUSER {
+                                first_user = u;
                             }
-                        } else {
-                            first_user = u;
+                            pers.prefetch(r.uid);
+                            st.bnd.push((w.offset_from(w0) as u32, u));
+                            cur_user = u;
                         }
-                        cur_user = u;
+                        *w = e;
+                        w = w.add(1);
                     }
-                    st.cur.push(e);
+                    st.cur.set_len(w.offset_from(w0) as usize);
+                }
+                // finish every block that a later user start closed; keep the open one
+                let mut a = 0usize;
+                let mut ou = open_user;
+                for bi in 0..st.bnd.len() {
+                    let (idx, u) = st.bnd[bi];
+                    let idx = idx as usize;
+                    if ou != NOUSER {
+                        if in_head {
+                            st.pieces.push((s, 0, ou, st.cur[a..idx].to_vec()));
+                            in_head = false;
+                        } else {
+                            finish_user_s(ou, &st.cur[a..idx], sh_r, &mut st.us, &mut st.out);
+                        }
+                    }
+                    a = idx;
+                    ou = u;
+                }
+                if a > 0 {
+                    st.cur.drain(..a);
                 }
             }
             if cur_user != NOUSER {
