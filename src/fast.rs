@@ -614,6 +614,51 @@ struct UEv {
     price: u32,
 }
 
+/// a click: cid = click index (or SPECIAL | index), uid = uid number (or SPECIAL | index)
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
+struct C16 {
+    cid: u32,
+    uid: u32,
+    ts: u32, // ms since click window start
+    camp: u32,
+}
+
+/// click id -> click index (< 2^31) or SPECIAL | index
+#[inline(always)]
+unsafe fn dec_cid(s: &[u8], ckey: u64) -> u32 {
+    if let Some(x) = unsafe { raw_idv(s.as_ptr(), s.len(), b'k', &B36T) } {
+        let v = unscr(x, ckey);
+        if v < (1 << 31) {
+            return v as u32;
+        }
+    }
+    special_id(s)
+}
+
+/// packed key of a click id, for byte-wise comparison on ts ties
+fn cid_key(c: u32, ckey: u64) -> u64 {
+    if c & SPECIAL != 0 {
+        return special_key(c & !SPECIAL);
+    }
+    let mut buf = [0u8; 16];
+    buf[0] = b'k';
+    let mut v = scramble(c as u64, ckey);
+    let mut tmp = [0u8; 13];
+    let mut at = 13;
+    loop {
+        at -= 1;
+        tmp[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
+        v /= 36;
+        if v == 0 {
+            break;
+        }
+    }
+    let len = 13 - at;
+    buf[1..1 + len].copy_from_slice(&tmp[at..]);
+    key(&buf[..1 + len])
+}
+
 /// open-addressing map uid number -> class
 struct P32 {
     t: Vec<(u32, u32)>,
@@ -771,6 +816,7 @@ fn build_persons(lparts: &[(Vec<u8>, Vec<(u64, u64, u64, u64)>)]) -> Persons {
 
 // ---------- sessions for one person ----------
 struct SessCx<'a> {
+    ckey: u64,
     ws: i64,
     cws: i64,
     ndays: usize,
@@ -793,7 +839,7 @@ struct SessSc {
 
 /// ev: one person's events sorted by ts; cl: the person's valid clicks sorted by ts.
 #[allow(clippy::too_many_arguments)]
-fn sess_one(name: u64, ev: &[UEv], cl: &[Ck], cx: &SessCx, sc: &mut SessSc, users: &mut Vec<UserRow>, camp_out: &mut [[i64; 4]]) {
+fn sess_one(name: u64, ev: &[UEv], cl: &[C16], cx: &SessCx, sc: &mut SessSc, users: &mut Vec<UserRow>, camp_out: &mut [[i64; 4]]) {
     let ws = cx.ws;
     let base_day = ws.div_euclid(DAY);
     let ndays = cx.ndays;
@@ -882,11 +928,11 @@ fn sess_one(name: u64, ev: &[UEv], cl: &[Ck], cx: &SessCx, sc: &mut SessSc, user
             let mut r = q - 1;
             while r > 0 && cts[r - 1] == t {
                 r -= 1;
-                if cmp_key(cl[r].cid, cl[best].cid) == Ordering::Less {
+                if cmp_key(cid_key(cl[r].cid, cx.ckey), cid_key(cl[best].cid, cx.ckey)) == Ordering::Less {
                     best = r;
                 }
             }
-            camp = cl[best].camp;
+            camp = cl[best].camp as u16;
         }
         let a = &mut camp_out[camp as usize * ndays + sc.s_day[s]];
         a[0] += 1;
@@ -931,7 +977,7 @@ fn sess_one(name: u64, ev: &[UEv], cl: &[Ck], cx: &SessCx, sc: &mut SessSc, user
 
 // ---------- per-user processing ----------
 struct ClickQ {
-    cks: Vec<Ck>,
+    cks: Vec<C16>,
     ofs: Vec<u32>, // 2^CSH + 1 offsets
 }
 
@@ -951,7 +997,7 @@ struct UserSc {
     pidx: Vec<u16>,
     cache: Vec<(u32, u16)>,
     evbuf: Vec<UEv>,
-    ckbuf: Vec<Ck>,
+    ckbuf: Vec<C16>,
 }
 
 struct Out {
@@ -1014,7 +1060,7 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
     }
     let q = (u >> CSH) as usize;
     let lu = (u & ((1 << CSH) - 1)) as usize;
-    let cks: &[Ck] = if q < sh.cq.len() {
+    let cks: &[C16] = if q < sh.cq.len() {
         let c = &sh.cq[q];
         if c.ofs.is_empty() { &[] } else { &c.cks[c.ofs[lu] as usize..c.ofs[lu + 1] as usize] }
     } else {
@@ -1064,18 +1110,18 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
         // clicks of this person
         let mut all = true;
         for c in cks {
-            let i = look(c.person as u32, &mut us.plist, &mut us.cache);
+            let i = look(c.uid, &mut us.plist, &mut us.cache);
             if i as usize != pi {
                 all = false;
                 break;
             }
         }
-        let cl: &[Ck] = if all {
+        let cl: &[C16] = if all {
             cks
         } else {
             us.ckbuf.clear();
             for c in cks {
-                let i = look(c.person as u32, &mut us.plist, &mut us.cache);
+                let i = look(c.uid, &mut us.plist, &mut us.cache);
                 if i as usize == pi {
                     us.ckbuf.push(*c);
                 }
@@ -1302,6 +1348,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let mut total_ev: u64 = 0;
     let mut total_ck: u64 = 0;
     let mut biggest_ev: Option<usize> = None;
+    let mut biggest_ck: Option<usize> = None;
     for (kind, dir) in [(Kind::Ev, "events"), (Kind::Ck, "clicks"), (Kind::Ln, "links")] {
         for p in list_csv(&data.join(dir)) {
             let Ok(f) = File::open(&p) else { continue };
@@ -1318,6 +1365,9 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             }
             if kind == Kind::Ck {
                 total_ck += len;
+                if biggest_ck.map(|b| files[b].1 < len).unwrap_or(true) {
+                    biggest_ck = Some(fi);
+                }
             }
             files.push((f, len));
             let step = (*K_CHUNK as u64).max(4096);
@@ -1388,6 +1438,41 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         let Some(uk) = search_key(&um, 512, ub, ub * 512, nt) else { return Err("user key".into()) };
         (ek, uk, est_lines)
     };
+    // click key from a sample of the largest clicks file
+    let ckey = {
+        use std::os::unix::fs::FileExt;
+        let Some(bc) = biggest_ck else { return Err("no clicks".into()) };
+        let (f, len) = &files[bc];
+        let n = (*len).min(1 << 20) as usize;
+        let mut b = vec![0u8; n];
+        f.read_exact_at(&mut b, 0).map_err(|e| e.to_string())?;
+        let mut cm = vec![];
+        let (mut lines, mut bytes) = (0usize, 0usize);
+        let mut it = b.split(|&c| c == b'\n');
+        it.next();
+        for line in it {
+            lines += 1;
+            bytes += line.len() + 1;
+            let fs: Vec<&[u8]> = line.split(|&c| c == b',').collect();
+            if fs.len() != 4 {
+                continue;
+            }
+            let x = fs[0];
+            let x = if x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"' { &x[1..x.len() - 1] } else { x };
+            if x.len() >= 2 && x[0] == b'k' {
+                if let Some(v) = b36_safe(&x[1..]) {
+                    cm.push(unmix(v));
+                }
+            }
+        }
+        if lines < 100 {
+            return Err("click sample".into());
+        }
+        let est_ck_lines = (total_ck as f64 / (bytes as f64 / lines as f64)) as u64 + 1024;
+        let cb = est_ck_lines * 3 / 2 + 4096;
+        let Some(ck) = search_key(&cm, 1, cb, cb, nt) else { return Err("click key".into()) };
+        ck
+    };
     log("keys");
     let vb = est_lines * 3 / 2 + 4096;
     let psh = {
@@ -1438,10 +1523,10 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         wc8: Wc<DRec, 8>,
         purs: Vec<Vec<PRec>>,
         sparse: Vec<SRec>,
-        wck: Wc<Ck, 2>,
-        spck: Vec<Ck>,
+        wck: Wc<C16, 4>,
+        spck: Vec<C16>,
         ev: Vec<Vec<DRec>>,
-        ck: Vec<Vec<Ck>>,
+        ck: Vec<Vec<C16>>,
         maxp: usize,
     }
     let products = &products;
@@ -1457,7 +1542,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 buf: vec![],
                 wc: if *K_VAR & 8 == 0 { Wc::new_n(nparts, cap, nparts) } else { Wc::empty() },
                 wc8: if *K_VAR & 8 != 0 { Wc::new_n(nparts, cap, nparts) } else { Wc::empty() },
-                purs: (0..nparts).map(|_| Vec::new()).collect(),
+                purs: (0..nparts).map(|_| Vec::with_capacity(((1usize << psh) / 25) / nt + 8)).collect(),
                 sparse: vec![],
                 wck: Wc::new_n(NCQ, cap_ck, ncq_used),
                 spck: vec![],
@@ -1486,6 +1571,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                             let wc = &mut st.wc;
                             match var & 23 {
                                 16 => parse_ev::<16, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                18 => parse_ev::<64, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 17 => parse_ev::<17, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 0 => parse_ev::<0, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 1 => parse_ev::<1, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
@@ -1511,7 +1597,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                             }
                             let Some(ci) = (unsafe { campaigns.get_fast(camp) }) else { return };
                             let u = unsafe { dec_uid(uid, ukey) };
-                            let c = Ck { person: u as u64, cid: unsafe { key_fast(cid) }, ts: (t - cws) as u32, camp: ci };
+                            let c = C16 { cid: unsafe { dec_cid(cid, ckey) }, uid: u, ts: (t - cws) as u32, camp: ci as u32 };
                             if u & SPECIAL == 0 {
                                 wck.push(((u >> 9) >> CSH) as usize, c);
                             } else {
@@ -1587,7 +1673,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let (ckside, cq) = run_map(
         nt,
         NCQ,
-        |_| Vec::<(u64, Ck)>::new(),
+        |_| Vec::<(u64, C16)>::new(),
         |side, q| {
             let n: usize = sa_r.iter().map(|s| s.ck[q].len()).sum();
             if n == 0 {
@@ -1601,14 +1687,14 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 let v = &s.ck[q];
                 for (j, c) in v.iter().enumerate() {
                     if j + 8 < v.len() {
-                        pers.ptab.prefetch(v[j + 8].person as u32);
+                        pers.ptab.prefetch(v[j + 8].uid);
                     }
-                    let (p, complex) = pers.of(c.person as u32);
+                    let (p, complex) = pers.of(c.uid);
                     cplx.push(complex);
                     if complex {
                         side.push((p, *c));
                     } else {
-                        cnt[((c.person as u32 >> 9) - base) as usize + 1] += 1;
+                        cnt[((c.uid >> 9) - base) as usize + 1] += 1;
                         kept += 1;
                     }
                 }
@@ -1617,13 +1703,13 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 cnt[i] += cnt[i - 1];
             }
             let ofs = cnt.clone();
-            let mut out: Vec<Ck> = Vec::with_capacity(kept);
+            let mut out: Vec<C16> = Vec::with_capacity(kept);
             unsafe { out.set_len(kept) };
             let mut i = 0usize;
             for s in sa_r.iter() {
                 for c in &s.ck[q] {
                     if !cplx[i] {
-                        let l = ((c.person as u32 >> 9) - base) as usize;
+                        let l = ((c.uid >> 9) - base) as usize;
                         out[cnt[l] as usize] = *c;
                         cnt[l] += 1;
                     }
@@ -1640,6 +1726,13 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         },
     );
     log("clicks");
+    // the per-thread click buckets are grouped now; release them before phase B allocates
+    let mut sa = sa;
+    for x in sa.iter_mut() {
+        x.ck = vec![];
+    }
+    let sa = sa;
+    let sa_r = &sa;
 
     // ---- phase B: event-index order, one user block at a time ----
     let base_day = ws.div_euclid(DAY);
@@ -1650,7 +1743,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         sparse: &sparse_map,
         sparse_bits: &sparse_bits,
         ukey,
-        scx: SessCx { ws, cws, ndays, organic, cat_rank: &cat_rank },
+        scx: SessCx { ckey, ws, cws, ndays, organic, cat_rank: &cat_rank },
     };
     let np = maxp + 1;
     let nseg = (nt * *K_SEGF).min(np).max(1);
@@ -1881,10 +1974,10 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     for o in outs.iter_mut() {
         side.append(&mut o.side);
     }
-    let mut sck: Vec<(u64, Ck)> = ckside.into_iter().flatten().collect();
+    let mut sck: Vec<(u64, C16)> = ckside.into_iter().flatten().collect();
     for s in sa.iter() {
         for c in &s.spck {
-            sck.push((pers.of(c.person as u32).0, *c));
+            sck.push((pers.of(c.uid).0, *c));
         }
     }
     drop(sa);
@@ -1909,7 +2002,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let (sout, _) = run_map(
         nt,
         sgroups.len(),
-        |_| (new_us(), new_out(), Vec::<UEv>::new(), Vec::<Ck>::new()),
+        |_| (new_us(), new_out(), Vec::<UEv>::new(), Vec::<C16>::new()),
         |st, g| {
             let (i, j) = sgroups_r[g];
             let p = side_r[i].0;
@@ -1926,7 +2019,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 let lu = (u & ((1 << CSH) - 1)) as usize;
                 if q < cq.len() && !cq[q].ofs.is_empty() {
                     for c in &cq[q].cks[cq[q].ofs[lu] as usize..cq[q].ofs[lu + 1] as usize] {
-                        if pers.of(c.person as u32).0 == p {
+                        if pers.of(c.uid).0 == p {
                             st.3.push(*c);
                         }
                     }

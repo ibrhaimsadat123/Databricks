@@ -906,6 +906,12 @@ fn for_rows_fast_v<const N: usize, const V: u32>(buf: &[u8], s: usize, e: usize,
             ls = ni;
             continue;
         };
+        if V & 64 != 0 {
+            // framing only (measurement)
+            std::hint::black_box(mc[0] ^ mc[1] ^ mq[0] ^ mq[1]);
+            ls += le_off + 1;
+            continue;
+        }
         // restrict masks to the line
         let m0 = low_mask(le_off);
         let m1 = if le_off > 64 { low_mask(le_off - 64) } else { 0 };

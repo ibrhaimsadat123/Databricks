@@ -109,16 +109,17 @@ impl T {
 
 pub(crate) fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut out: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.data.len() + c.defs.len() / 8 + 64).sum::<usize>() + 4096);
-    out.extend_from_slice(b"PAR1");
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+    out.write_all(b"PAR1")?;
+    let mut pos: i64 = 4;
     let mut metas: Vec<(i64, i64)> = vec![]; // (page offset, chunk size)
     for c in cols {
-        let off = out.len() as i64;
+        let off = pos;
         let mut body: Vec<u8> = vec![];
         if let Kind::OptStr = c.kind {
             // RLE/bit-packed hybrid, bit width 1, one bit-packed run
             let groups = c.defs.len().div_ceil(8);
-            let mut lv: Vec<u8> = vec![];
+            let mut lv: Vec<u8> = Vec::with_capacity(groups + 16);
             let mut h = ((groups as u64) << 1) | 1;
             while h >= 0x80 {
                 lv.push((h as u8) | 0x80);
@@ -149,10 +150,11 @@ pub(crate) fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) -> std::
         ph.i32f(4, 3); // RLE
         ph.end();
         ph.b.push(0);
-        out.extend_from_slice(&ph.b);
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&c.data);
-        metas.push((off, out.len() as i64 - off));
+        out.write_all(&ph.b)?;
+        out.write_all(&body)?;
+        out.write_all(&c.data)?;
+        pos += (ph.b.len() + body.len() + c.data.len()) as i64;
+        metas.push((off, pos - off));
     }
     let mut m = T::new();
     m.i32f(1, 1);
@@ -228,10 +230,9 @@ pub(crate) fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) -> std::
     m.end();
     m.strf(6, b"sess");
     m.b.push(0);
-    out.extend_from_slice(&m.b);
-    out.extend_from_slice(&(m.b.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(&out)?;
+    out.write_all(&m.b)?;
+    out.write_all(&(m.b.len() as u32).to_le_bytes())?;
+    out.write_all(b"PAR1")?;
+    out.flush()?;
     Ok(())
 }
