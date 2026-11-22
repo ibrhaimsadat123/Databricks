@@ -131,6 +131,37 @@ unsafe fn b36v(p: *const u8, k: usize, tab: &[(A16, A16)]) -> Option<u64> {
     }
 }
 
+/// Two canonical base36 strings at once (AVX2 lanes): (pa, ka) and (pb, kb), 16 readable bytes each.
+#[inline(always)]
+unsafe fn b36v2(pa: *const u8, ka: usize, pb: *const u8, kb: usize, tab: &[(A16, A16)]) -> (Option<u64>, Option<u64>) {
+    unsafe {
+        let ka_ok = ka.wrapping_sub(1) < 8;
+        let kb_ok = kb.wrapping_sub(1) < 8;
+        let ta = tab.get_unchecked(if ka_ok { ka } else { 0 });
+        let tb = tab.get_unchecked(if kb_ok { kb } else { 0 });
+        let raw = _mm256_set_m128i(_mm_loadu_si128(pb as *const __m128i), _mm_loadu_si128(pa as *const __m128i));
+        let shm = _mm256_set_m128i(_mm_load_si128(tb.0.0.as_ptr() as *const __m128i), _mm_load_si128(ta.0.0.as_ptr() as *const __m128i));
+        let pad = _mm256_set_m128i(_mm_load_si128(tb.1.0.as_ptr() as *const __m128i), _mm_load_si128(ta.1.0.as_ptr() as *const __m128i));
+        let x = _mm256_or_si256(_mm256_shuffle_epi8(raw, shm), pad);
+        let ge0 = _mm256_cmpgt_epi8(x, _mm256_set1_epi8(0x2F));
+        let le9 = _mm256_cmpgt_epi8(_mm256_set1_epi8(0x3A), x);
+        let gea = _mm256_cmpgt_epi8(x, _mm256_set1_epi8(0x60));
+        let lez = _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7B), x);
+        let ok = _mm256_or_si256(_mm256_and_si256(ge0, le9), _mm256_and_si256(gea, lez));
+        let mm = _mm256_movemask_epi8(ok) as u32;
+        let d = _mm256_sub_epi8(_mm256_sub_epi8(x, _mm256_set1_epi8(0x30)), _mm256_and_si256(gea, _mm256_set1_epi8(39)));
+        let a = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0124));
+        let b = _mm256_madd_epi16(a, _mm256_set1_epi32(0x0001_0510));
+        let qa = _mm256_extract_epi64::<0>(b) as u64;
+        let qb = _mm256_extract_epi64::<2>(b) as u64;
+        let va = (qa & 0xFFFF_FFFF) * 1_679_616 + (qa >> 32);
+        let vb = (qb & 0xFFFF_FFFF) * 1_679_616 + (qb >> 32);
+        let oka = ka_ok && (mm & 0xFFFF) == 0xFFFF && !(ka > 1 && *pa == b'0') && va <= MASK40;
+        let okb = kb_ok && (mm >> 16) == 0xFFFF && !(kb > 1 && *pb == b'0') && vb <= MASK40;
+        (if oka { Some(va) } else { None }, if okb { Some(vb) } else { None })
+    }
+}
+
 /// scrambled value of an ID "<prefix><base36>" of total length n at p
 #[inline(always)]
 unsafe fn raw_idv(p: *const u8, n: usize, prefix: u8, tab: &[(A16, A16)]) -> Option<u64> {
@@ -1128,15 +1159,37 @@ fn parse_ev<const V: u32, const K: usize>(b: &[u8], s: usize, e: usize, cx: &EvC
                     Some(p) => pr = p,
                     None => break 'v,
                 }
-                cat = products.get(pid).unwrap_or(unknown_cat) as u32;
+                cat = (unsafe { products.get_fast(pid) }).unwrap_or(unknown_cat) as u32;
             }
             tsr = (t - ws) as u32;
             typ = ty;
         }
-        let u = if typ != 3 { unsafe { dec_uid(uid, ukey) } } else { 0 };
-        let v = match unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) } {
-            Some(x) => unscr(x, ekey),
-            None => u64::MAX,
+        let (v, u) = if V & 16 != 0 {
+            // both IDs in one AVX2 pass
+            let (ne, nu) = (eid.len(), uid.len());
+            let pe = eid.as_ptr();
+            let pu = uid.as_ptr();
+            let (xe, xu) = unsafe { b36v2(pe.add(1), ne.wrapping_sub(1), pu.add(1), nu.wrapping_sub(1), &B36T) };
+            let v = match xe {
+                Some(x) if ne >= 2 && unsafe { *pe } == b'e' => unscr(x, ekey),
+                _ => u64::MAX,
+            };
+            let u = if typ == 3 {
+                0
+            } else {
+                match xu {
+                    Some(x) if nu >= 2 && unsafe { *pu } == b'u' && unscr(x, ukey) < (1 << 31) => unscr(x, ukey) as u32,
+                    _ => special_id(uid),
+                }
+            };
+            (v, u)
+        } else {
+            let u = if typ != 3 { unsafe { dec_uid(uid, ukey) } } else { 0 };
+            let v = match unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) } {
+                Some(x) => unscr(x, ekey),
+                None => u64::MAX,
+            };
+            (v, u)
         };
         if v < vb {
             let p = (v >> psh) as usize;
@@ -1431,7 +1484,9 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                             }
                         } else {
                             let wc = &mut st.wc;
-                            match var & 7 {
+                            match var & 23 {
+                                16 => parse_ev::<16, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                17 => parse_ev::<17, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 0 => parse_ev::<0, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 1 => parse_ev::<1, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 2 => parse_ev::<2, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
@@ -1454,7 +1509,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                             if t < cws || t >= we {
                                 return;
                             }
-                            let Some(ci) = campaigns.get(camp) else { return };
+                            let Some(ci) = (unsafe { campaigns.get_fast(camp) }) else { return };
                             let u = unsafe { dec_uid(uid, ukey) };
                             let c = Ck { person: u as u64, cid: unsafe { key_fast(cid) }, ts: (t - cws) as u32, camp: ci };
                             if u & SPECIAL == 0 {
@@ -1540,15 +1595,21 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             }
             let base = (q as u32) << CSH;
             let mut cnt = vec![0u32; (1 << CSH) + 1];
-            let mut keep: Vec<Ck> = Vec::with_capacity(n);
+            let mut cplx: Vec<bool> = Vec::with_capacity(n);
+            let mut kept = 0usize;
             for s in sa_r.iter() {
-                for c in &s.ck[q] {
+                let v = &s.ck[q];
+                for (j, c) in v.iter().enumerate() {
+                    if j + 8 < v.len() {
+                        pers.ptab.prefetch(v[j + 8].person as u32);
+                    }
                     let (p, complex) = pers.of(c.person as u32);
+                    cplx.push(complex);
                     if complex {
                         side.push((p, *c));
                     } else {
                         cnt[((c.person as u32 >> 9) - base) as usize + 1] += 1;
-                        keep.push(*c);
+                        kept += 1;
                     }
                 }
             }
@@ -1556,12 +1617,18 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 cnt[i] += cnt[i - 1];
             }
             let ofs = cnt.clone();
-            let mut out: Vec<Ck> = Vec::with_capacity(keep.len());
-            unsafe { out.set_len(keep.len()) };
-            for c in &keep {
-                let l = ((c.person as u32 >> 9) - base) as usize;
-                out[cnt[l] as usize] = *c;
-                cnt[l] += 1;
+            let mut out: Vec<Ck> = Vec::with_capacity(kept);
+            unsafe { out.set_len(kept) };
+            let mut i = 0usize;
+            for s in sa_r.iter() {
+                for c in &s.ck[q] {
+                    if !cplx[i] {
+                        let l = ((c.person as u32 >> 9) - base) as usize;
+                        out[cnt[l] as usize] = *c;
+                        cnt[l] += 1;
+                    }
+                    i += 1;
+                }
             }
             for l in 0..(1usize << CSH) {
                 let (a, b) = (ofs[l] as usize, ofs[l + 1] as usize);
@@ -1587,7 +1654,55 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     };
     let np = maxp + 1;
     let nseg = (nt * *K_SEGF).min(np).max(1);
-    let seg_lo = |s: usize| s * np / nseg;
+    // Segment boundaries, nudged to partition boundaries that no user seems to straddle (the
+    // valid record with the largest index before the boundary and the one with the smallest index
+    // after it belong to different users). Only an efficiency heuristic: users that do straddle a
+    // boundary are still merged across segments below.
+    let bounds: Vec<usize> = {
+        let edge = |p: usize, want_max: bool| -> u32 {
+            let mut best: Option<(u32, u32)> = None;
+            for x in sa.iter() {
+                for r in &x.ev[p] {
+                    if (r.meta >> 22) & 3 == 3 || r.uid & SPECIAL != 0 {
+                        continue;
+                    }
+                    let vl = r.meta & vmask;
+                    let better = match best {
+                        None => true,
+                        Some((bv, _)) => if want_max { vl > bv } else { vl < bv },
+                    };
+                    if better {
+                        best = Some((vl, r.uid >> 9));
+                    }
+                }
+            }
+            best.map(|b| b.1).unwrap_or(NOUSER)
+        };
+        let mut b = vec![0usize; nseg + 1];
+        b[nseg] = np;
+        for si in 1..nseg {
+            let nominal = si * np / nseg;
+            let mut q = nominal.max(b[si - 1] + 1);
+            let limit = (q + np / nseg).min(np - 1);
+            while q < limit {
+                let a = edge(q - 1, true);
+                let c = edge(q, false);
+                if a != c || a == NOUSER {
+                    break;
+                }
+                q += 1;
+            }
+            b[si] = q.min(np);
+        }
+        for si in 1..=nseg {
+            if b[si] < b[si - 1] {
+                b[si] = b[si - 1];
+            }
+        }
+        b
+    };
+    let bounds = &bounds;
+    let seg_lo = |s: usize| bounds[s];
     struct SB {
         slot: Vec<u32>,
         pbuf: Vec<PRec>,
@@ -1670,6 +1785,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                     }
                     let u = r.uid >> 9;
                     if u != cur_user {
+                        pers.ptab.prefetch(r.uid);
                         if cur_user != NOUSER {
                             if u < cur_user {
                                 st.bad = true;
@@ -1730,6 +1846,11 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             Some(g) if g.0 == u => g.1.extend_from_slice(&ev),
             _ => groups.push((u, ev)),
         }
+    }
+    if std::env::var_os("VERBOSE").is_some() {
+        let tot: usize = groups.iter().map(|g| g.1.len()).sum();
+        let big = groups.iter().map(|g| g.1.len()).max().unwrap_or(0);
+        eprintln!("boundary groups {} events {} largest {}", groups.len(), tot, big);
     }
     let groups_r = &groups;
     let (fix, _) = run_map(
@@ -2053,6 +2174,28 @@ pub(crate) fn fuzz_fast() {
             if bad < 20 { eprintln!("B36 MISMATCH {:?} ref {:?} sse {:?} swar {:?}", String::from_utf8_lossy(&b), r, f, s); }
         }
         b.clear();
+    }
+    // IdTable fast lookup
+    let mut camps = IdTable::new(b"c_");
+    for i in [1usize, 2, 7, 10, 99, 100, 1999, 2000, 123456] {
+        camps.insert_if_absent(format!("c_{i}").as_bytes(), i as u16);
+    }
+    camps.insert_if_absent(b"C_5", 77);
+    camps.insert_if_absent(b"weird", 78);
+    let atoms: [&[u8]; 16] = [b"c_", b"C_", b"c", b"_", b"0", b"1", b"2", b"7", b"9", b"99", b"100", b"x", b" ", b"5", b"weird", b"1999"];
+    for _ in 0..2_000_000 {
+        let mut b: Vec<u8> = vec![];
+        for _ in 0..(1 + next() % 4) {
+            b.extend_from_slice(atoms[(next() % 16) as usize]);
+        }
+        let mut pad = b.clone();
+        pad.resize(b.len() + 16, b'3');
+        let f = unsafe { camps.get_fast(&pad[..b.len()]) };
+        let r = camps.get(&b);
+        if f != r {
+            bad += 1;
+            if bad < 20 { eprintln!("IDTAB MISMATCH {:?} {:?} {:?}", String::from_utf8_lossy(&b), f, r); }
+        }
     }
     eprintln!("fuzz_fast done, mismatches: {bad}");
 }

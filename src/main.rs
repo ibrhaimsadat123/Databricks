@@ -634,6 +634,28 @@ impl IdTable {
             true
         }
     }
+    /// get() for fields inside a padded buffer (reads 8 bytes past the prefix)
+    #[inline(always)]
+    unsafe fn get_fast(&self, s: &[u8]) -> Option<u16> {
+        let pl = self.prefix.len();
+        let n = s.len();
+        if n > pl && n <= pl + 7 && pl <= 2 && s[0] == self.prefix[0] && (pl == 1 || s[1] == self.prefix[1]) {
+            let k = n - pl;
+            let p = unsafe { s.as_ptr().add(pl) };
+            let raw = unsafe { std::ptr::read_unaligned(p as *const u64) };
+            let lm = (1u64 << (8 * k)) - 1;
+            let x = (raw & lm) | (!lm & DIGIT_LO);
+            let d = x.wrapping_sub(DIGIT_LO);
+            if ((x & HI8) | ((d.wrapping_add(0x7676_7676_7676_7676) | d) & HI8)) == 0 && !(k > 1 && (raw & 0xFF) == 0x30) {
+                let v = swar8(d << (8 * (8 - k))) as usize;
+                return match self.arr.get(v) {
+                    Some(&r) if r != NONE16 => Some(r),
+                    _ => None,
+                };
+            }
+        }
+        self.get(s)
+    }
     #[inline(always)]
     fn get(&self, s: &[u8]) -> Option<u16> {
         if let Some(n) = num_id(s, self.prefix) {
