@@ -1632,6 +1632,22 @@ fn fuzz_rows() {
     eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
 }
 
+/// Worker threads when NCPU is not set: the CPUs this process may run on (the scorer pins 8
+/// vCPUs), at most 8. A cgroup CPU quota is deliberately not consulted.
+pub(crate) fn default_threads() -> usize {
+    let mut n = 0usize;
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+            n = libc::CPU_COUNT(&set) as usize;
+        }
+    }
+    if n == 0 {
+        n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    }
+    n.clamp(1, 8)
+}
+
 fn main() {
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
@@ -1668,22 +1684,22 @@ fn main() {
     let t0 = std::time::Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let nt: usize = std::env::var("NCPU")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
-        .max(1);
+    let nt: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or_else(default_threads).max(1);
     let verbose = std::env::var("VERBOSE").is_ok();
-    let last = std::cell::Cell::new((0f64, 0f64));
+    if verbose {
+        eprintln!("threads {nt} (default {})", default_threads());
+    }
+    let last = std::cell::Cell::new((0f64, 0f64, 0i64));
     let log = |m: &str| {
         if verbose {
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
             unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
             let u = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6;
             let sy = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6;
-            let (pu, ps) = last.get();
-            last.set((u, sy));
-            eprintln!("{m:12} wall {:6.3}  user +{:.2}  sys +{:.2}", t0.elapsed().as_secs_f64(), u - pu, sy - ps);
+            let fl = ru.ru_minflt as i64;
+            let (pu, ps, pf) = last.get();
+            last.set((u, sy, fl));
+            eprintln!("{m:12} wall {:6.3}  user +{:.2}  sys +{:.2}  flt +{}", t0.elapsed().as_secs_f64(), u - pu, sy - ps, fl - pf);
         }
     };
 
