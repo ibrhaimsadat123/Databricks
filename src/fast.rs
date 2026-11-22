@@ -3567,6 +3567,8 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         spck: Vec<C16>,
         ev: Vec<Vec<DRec>>,
         ck: Vec<Vec<C16>>,
+        evo: Vec<(u32, Vec<DRec>)>,
+        cko: Vec<(u32, Vec<C16>)>,
         maxp: usize,
     }
     let products = &products;
@@ -3587,6 +3589,8 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 spck: vec![],
                 ev: vec![],
                 ck: vec![],
+                evo: vec![],
+                cko: vec![],
                 maxp: 0,
             },
             |st, t| {
@@ -3700,13 +3704,13 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     for s in sa.iter_mut() {
         if *K_VAR & 8 != 0 {
             let w = std::mem::replace(&mut s.wc8, Wc::empty());
-            s.ev = w.finish();
+            (s.ev, s.evo) = w.finish_split();
         } else {
             let w = std::mem::replace(&mut s.wc, Wc::empty());
-            s.ev = w.finish();
+            (s.ev, s.evo) = w.finish_split();
         }
         let w = std::mem::replace(&mut s.wck, Wc::empty());
-        s.ck = w.finish();
+        (s.ck, s.cko) = w.finish_split();
     }
     drop(link_slots);
     // unmap the inputs on several threads (one serial teardown at exit otherwise)
@@ -3773,12 +3777,21 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
 
     // ---- clicks: per user range, drop complex persons' clicks to the side, sort per user ----
     let sa_r = &sa;
+    // overflow vectors of the click buckets, per queue
+    let mut ckov: Vec<Vec<&[C16]>> = (0..NCQ).map(|_| vec![]).collect();
+    for s in sa_r.iter() {
+        for (b, v) in s.cko.iter() {
+            ckov[*b as usize].push(&v[..]);
+        }
+    }
+    let ckov_r = &ckov;
     let (ckside, cq) = run_map(
         nt,
         NCQ,
         |_| Vec::<(u64, C16)>::new(),
         |side, q| {
-            let n: usize = sa_r.iter().map(|s| s.ck[q].len()).sum();
+            let srcs: Vec<&[C16]> = sa_r.iter().map(|s| &s.ck[q][..]).chain(ckov_r[q].iter().copied()).collect();
+            let n: usize = srcs.iter().map(|v| v.len()).sum();
             if n == 0 {
                 return ClickQ { cks: vec![], ofs: vec![] };
             }
@@ -3786,8 +3799,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             let mut cnt = vec![0u32; (1 << CSH) + 1];
             let mut cplx: Vec<bool> = Vec::with_capacity(n);
             let mut kept = 0usize;
-            for s in sa_r.iter() {
-                let v = &s.ck[q];
+            for v in srcs.iter() {
                 for c in v.iter() {
                     // only users touched by a complex person need the full lookup
                     let complex = pers.maybe_complex(c.uid >> 9) && {
@@ -3811,8 +3823,8 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             let mut out: Vec<C16> = Vec::with_capacity(kept);
             unsafe { out.set_len(kept) };
             let mut i = 0usize;
-            for s in sa_r.iter() {
-                for c in &s.ck[q] {
+            for v in srcs.iter() {
+                for c in v.iter() {
                     if !cplx[i] {
                         let l = ((c.uid >> 9) - base) as usize;
                         out[cnt[l] as usize] = *c;
@@ -3832,9 +3844,11 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     );
     log("clicks");
     // the per-thread click buckets are grouped now; release them before phase B allocates
+    drop(ckov);
     let mut sa = sa;
     for x in sa.iter_mut() {
         x.ck = vec![];
+        x.cko = vec![];
     }
     let sa = sa;
     let sa_r = &sa;
@@ -3939,6 +3953,16 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         us
     };
     let sh_r = &sh;
+    // overflow vectors of the event buckets, per partition
+    let mut evov: Vec<Vec<&[DRec]>> = (0..np).map(|_| vec![]).collect();
+    for x in sa_r.iter() {
+        for (b, v) in x.evo.iter() {
+            if (*b as usize) < np {
+                evov[*b as usize].push(&v[..]);
+            }
+        }
+    }
+    let evov_r = &evov;
     let sb = run(
         nt,
         nseg,
@@ -3953,7 +3977,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             let mut in_head = s > 0;
             st.cur.clear();
             for p in p0..p1 {
-                let parts: Vec<&[DRec]> = sa_r.iter().map(|x| &x.ev[p][..]).collect();
+                let parts: Vec<&[DRec]> = sa_r.iter().map(|x| &x.ev[p][..]).chain(evov_r[p].iter().copied()).collect();
                 // dedup by direct placement: dense[v_low] keeps the copy with the smallest ingest
                 // (an empty slot has ingest i32::MAX; a copy with that ingest is invalid and can
                 // only lose, so dropping it changes nothing)

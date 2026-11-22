@@ -1451,16 +1451,19 @@ struct Wc<T: Copy, const K: usize> {
     out: Vec<Vec<T>>,
     st: Vec<[T; K]>,
     n: Vec<u8>,
+    /// full vectors of buckets that outgrew their capacity (bucket, records), in fill order;
+    /// a bucket continues in a fresh vector instead of being reallocated and copied
+    ovf: Vec<(u32, Vec<T>)>,
 }
 impl<T: Copy + Default, const K: usize> Wc<T, K> {
     fn new(nb: usize, cap: usize) -> Self {
         assert!((std::mem::size_of::<T>() * K) % 64 == 0 && std::mem::align_of::<T>() >= 16);
-        Wc { out: buckets_n(nb, cap), st: vec![[T::default(); K]; nb], n: vec![0; nb] }
+        Wc { out: buckets_n(nb, cap), st: vec![[T::default(); K]; nb], n: vec![0; nb], ovf: vec![] }
     }
     /// only the first `used` buckets get the capacity up front
     fn new_n(nb: usize, cap: usize, used: usize) -> Self {
         assert!((std::mem::size_of::<T>() * K) % 64 == 0 && std::mem::align_of::<T>() >= 16);
-        Wc { out: (0..nb).map(|i| Vec::with_capacity(if i < used { cap } else { 0 })).collect(), st: vec![[T::default(); K]; nb], n: vec![0; nb] }
+        Wc { out: (0..nb).map(|i| Vec::with_capacity(if i < used { cap } else { 0 })).collect(), st: vec![[T::default(); K]; nb], n: vec![0; nb], ovf: vec![] }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
@@ -1479,8 +1482,14 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
         unsafe {
             let v = self.out.get_unchecked_mut(b);
             if v.capacity() - v.len() < K {
-                v.reserve(K.max(v.len()));
+                // continue in a fresh vector (a quarter of the old capacity) instead of copying
+                let ncap = (v.capacity() / 4).max(16 * K);
+                let full = std::mem::replace(v, Vec::with_capacity(ncap));
+                if !full.is_empty() {
+                    self.ovf.push((b as u32, full));
+                }
             }
+            let v = self.out.get_unchecked_mut(b);
             let len = v.len();
             let dst = v.as_mut_ptr().add(len) as *mut u8;
             let src = self.st.get_unchecked(b).as_ptr() as *const u8;
@@ -1498,7 +1507,7 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
         }
     }
     fn empty() -> Self {
-        Wc { out: vec![], st: vec![], n: vec![] }
+        Wc { out: vec![], st: vec![], n: vec![], ovf: vec![] }
     }
     /// highest bucket holding a record (0 if none)
     fn top_nonempty(&self) -> usize {
@@ -1511,7 +1520,8 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
         }
         0
     }
-    fn finish(mut self) -> Vec<Vec<T>> {
+    /// per-bucket vectors (the vectors that overflowed are returned separately, in fill order)
+    fn finish_split(mut self) -> (Vec<Vec<T>>, Vec<(u32, Vec<T>)>) {
         for b in 0..self.n.len() {
             let c = self.n[b] as usize;
             let st = self.st[b];
@@ -1521,7 +1531,25 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
         unsafe {
             std::arch::x86_64::_mm_sfence();
         }
-        self.out
+        (self.out, self.ovf)
+    }
+    /// per-bucket vectors with every record in push order
+    fn finish(self) -> Vec<Vec<T>> {
+        let (mut out, ovf) = self.finish_split();
+        if !ovf.is_empty() {
+            let mut pre: Vec<Vec<T>> = (0..out.len()).map(|_| vec![]).collect();
+            for (b, v) in ovf {
+                pre[b as usize].extend_from_slice(&v);
+            }
+            for (b, p) in pre.into_iter().enumerate() {
+                if !p.is_empty() {
+                    let mut p = p;
+                    p.extend_from_slice(&out[b]);
+                    out[b] = p;
+                }
+            }
+        }
+        out
     }
 }
 
