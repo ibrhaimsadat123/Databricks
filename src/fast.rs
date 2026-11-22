@@ -3261,25 +3261,25 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let ncq_used = (est_users >> CSH) + 2;
 
     // ---- links ----
-    let lparts = run(
-        nt,
-        lchunks.len(),
-        |_| (Vec::<u8>::new(), Vec::<(u64, u64, u64, u64)>::new()),
-        |st, t| {
-            let c = &lchunks[t];
-            let (f, len) = &files[c.file];
-            let (s, e) = read_chunk(f, *len, c, &mut st.0);
-            let ln = &mut st.1;
-            for_rows_fast::<2>(&st.0, s, e, |[a, bb]| {
-                if !a.is_empty() && !bb.is_empty() {
-                    let (ia, ka) = unsafe { link_id(a, ukey) };
-                    let (ib, kb) = unsafe { link_id(bb, ukey) };
-                    ln.push((ia, ka, ib, kb));
-                }
-            });
-        },
-    );
-    log("links parsed");
+    // link chunks are the first tasks of phase A; union-find starts once they are all parsed
+    let nlc = lchunks.len();
+    let link_slots: Vec<Mutex<Vec<(u64, u64, u64, u64)>>> = (0..nlc).map(|_| Mutex::new(vec![])).collect();
+    let links_left = std::sync::atomic::AtomicUsize::new(nlc);
+    let parse_links = |t: usize, buf: &mut Vec<u8>| {
+        let c = &lchunks[t];
+        let (f, len) = &files[c.file];
+        let (s, e) = read_chunk(f, *len, c, buf);
+        let mut ln: Vec<(u64, u64, u64, u64)> = vec![];
+        for_rows_fast::<2>(buf, s, e, |[a, bb]| {
+            if !a.is_empty() && !bb.is_empty() {
+                let (ia, ka) = unsafe { link_id(a, ukey) };
+                let (ib, kb) = unsafe { link_id(bb, ukey) };
+                ln.push((ia, ka, ib, kb));
+            }
+        });
+        *link_slots[t].lock().unwrap() = ln;
+        links_left.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    };
 
     // ---- phase A: parse events and clicks (union-find runs alongside) ----
     struct SA {
@@ -3299,8 +3299,13 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let evcx = &EvCtx { ws, we, ukey, ekey, vb, psh, vmask, evwin, evloc, ingtab, products, unknown_cat };
     let ckcx = &CkCtx { cws, we, ukey, ckey, ckwin, ckloc, campaigns: &campaigns };
     let (pers, sa) = std::thread::scope(|scope| {
-        let lparts = &lparts;
+        let (link_slots, links_left) = (&link_slots, &links_left);
         let uf = scope.spawn(move || {
+            while links_left.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            let lparts: Vec<(Vec<u8>, Vec<(u64, u64, u64, u64)>)> = link_slots.iter().map(|m| (vec![], std::mem::take(&mut *m.lock().unwrap()))).collect();
+            let lparts = &lparts;
             let t = std::time::Instant::now();
             let r = if std::env::var_os("SESS_UF1").is_some() { build_persons(lparts) } else { build_persons2(lparts) };
             if std::env::var_os("VERBOSE").is_some() {
@@ -3310,7 +3315,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         });
         let sa = run(
             nt,
-            chunks.len(),
+            nlc + chunks.len(),
             |_| SA {
                 buf: vec![],
                 wc: if *K_VAR & 8 == 0 { Wc::new_n(nparts, cap, nparts) } else { Wc::empty() },
@@ -3324,7 +3329,11 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 maxp: 0,
             },
             |st, t| {
-                let c = &chunks[t];
+                if t < nlc {
+                    parse_links(t, &mut st.buf);
+                    return;
+                }
+                let c = &chunks[t - nlc];
                 let (f, len) = &files[c.file];
                 let (b, s, e): (&[u8], usize, usize) = match &maps[c.file] {
                     Some(mm) => {
@@ -3433,7 +3442,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         let w = std::mem::replace(&mut s.wck, Wc::empty());
         s.ck = w.finish();
     }
-    drop(lparts);
+    drop(link_slots);
     // unmap the inputs on several threads (one serial teardown at exit otherwise)
     std::thread::scope(|sc| {
         for m in maps.drain(..).flatten() {
