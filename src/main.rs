@@ -1500,6 +1500,17 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
     fn empty() -> Self {
         Wc { out: vec![], st: vec![], n: vec![] }
     }
+    /// highest bucket holding a record (0 if none)
+    fn top_nonempty(&self) -> usize {
+        let mut b = self.n.len();
+        while b > 0 {
+            b -= 1;
+            if self.n[b] != 0 || !self.out[b].is_empty() {
+                return b;
+            }
+        }
+        0
+    }
     fn finish(mut self) -> Vec<Vec<T>> {
         for b in 0..self.n.len() {
             let c = self.n[b] as usize;

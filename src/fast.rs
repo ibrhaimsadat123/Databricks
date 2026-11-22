@@ -11,11 +11,12 @@ static NSLOW: AtomicU64 = AtomicU64::new(0);
 static NSLOWC: AtomicU64 = AtomicU64::new(0);
 /// software prefetch distance in the line parsers (bytes ahead of the current line)
 const K_PF: usize = 1024;
-static K_VAR: LazyLock<u32> = LazyLock::new(|| knob("SESS_VAR", 200) as u32);
+static K_VAR: LazyLock<u32> = LazyLock::new(|| knob("SESS_VAR", 1224) as u32);
 static K_CHUNK: LazyLock<usize> = LazyLock::new(|| knob("SESS_CHUNK", 1 << 20));
 static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 0) != 0);
 static K_S2: LazyLock<bool> = LazyLock::new(|| knob("SESS_S2", 1) != 0);
 static K_POP: LazyLock<bool> = LazyLock::new(|| knob("SESS_POP", 0) != 0);
+static K_PFD: LazyLock<usize> = LazyLock::new(|| knob("SESS_PFD", 16));
 static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1536).max(16));
 static K_SEGF: LazyLock<usize> = LazyLock::new(|| knob("SESS_SEGF", 4).max(1));
 pub(crate) const MASK40: u64 = (1 << 40) - 1;
@@ -2409,6 +2410,255 @@ fn parse_ev4<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mu
     nslow
 }
 
+fn parse_ev6<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) -> usize {
+    assert!(buf.len() >= e + 128);
+    let mut nslow = 0usize;
+    let mut mp = *maxp;
+    unsafe {
+        let base = buf.as_ptr();
+        let (ws, we, ukey, ekey, vb, psh, vmask) = (cx.ws, cx.we, cx.ukey, cx.ekey, cx.vb, cx.psh, cx.vmask);
+        let loc = cx.evloc;
+        let itb = cx.ingtab;
+        let (lpat0, lpat1) = (loc.m[0].0, loc.m[1].0);
+        let (lbase0, lbase1) = (loc.m[0].1 - ws, loc.m[1].1 - ws);
+        let (ipat0, ipat1) = (itb.m[0].0, itb.m[1].0);
+        let (ibase0, ibase1) = ((itb.m[0].1 - ws) / 1000, (itb.m[1].1 - ws) / 1000);
+        let we_r = we - ws;
+        let ib = std::hint::black_box([ibase0, ibase1]);
+        let lb = [lbase0, lbase1];
+        // range limits for DD HH MI SS of the ts half, per month of `loc`
+        let lim_for = |dim: i64| -> __m256i {
+            let d = dim.clamp(0, 0xFFFF) as i16;
+            _mm256_setr_epi16(d, 23, 59, 59, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
+        };
+        let lim0 = lim_for(loc.m[0].2);
+        let lim1 = lim_for(loc.m[1].2);
+        let vmin = _mm256_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let cm = _mm256_set1_epi8(b',' as i8);
+        let qt = _mm256_set1_epi8(b'"' as i8);
+        let c0 = _mm256_set1_epi8(b'0' as i8);
+        let c9 = _mm256_set1_epi8(9);
+        let c25 = _mm256_set1_epi8(25);
+        let c49 = _mm256_set1_epi8(49);
+        let c39 = _mm256_set1_epi8(39);
+        let zero = _mm256_setzero_si256();
+        let w36 = _mm256_set1_epi16(0x0124);
+        let w1296 = _mm256_set1_epi32(0x0001_0510);
+        let w10 = _mm256_set1_epi16(0x010A);
+        let tplv = a32(*b"-00-00T00:00:00Z");
+        let digv = a32([0, 0, 0, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0]);
+        let pairv = a32([4, 5, 7, 8, 10, 11, 13, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        let tpl = _mm256_load_si256(tplv.0.as_ptr() as *const __m256i);
+        let digsel = _mm256_load_si256(digv.0.as_ptr() as *const __m256i);
+        let pairs = _mm256_load_si256(pairv.0.as_ptr() as *const __m256i);
+        let w2460 = _mm256_setr_epi16(24, 1, 60, 1, 0, 0, 0, 0, 24, 1, 60, 1, 0, 0, 0, 0);
+        let mm = |v: __m256i, t: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, t)) as u32;
+        let mut ls = s;
+        // lines starting at or before fast_end have their whole 96-byte window inside [.., e), so a
+        // newline found in the window ends the line before e (no per-line bound check)
+        let fast_end = if e >= 96 { e - 96 } else { 0 };
+        'line: while ls < e {
+            let lp = base.add(ls);
+            if K_PF != 0 {
+                _mm_prefetch::<_MM_HINT_T0>(lp.add(K_PF) as *const i8);
+            }
+            let y0 = _mm256_loadu_si256(lp as *const __m256i);
+            let y1 = _mm256_loadu_si256(lp.add(32) as *const __m256i);
+            let y2 = _mm256_loadu_si256(lp.add(64) as *const __m256i);
+            let nl01 = _mm256_or_si256(_mm256_cmpeq_epi8(y0, nl), _mm256_cmpeq_epi8(y1, nl));
+            let nlh = mm(y2, nl);
+            let l = 64 + nlh.trailing_zeros() as usize; // 96 if none
+            'fast: {
+                if _mm256_testz_si256(nl01, nl01) == 0 || l >= 96 || ls > fast_end {
+                    break 'fast;
+                }
+                let lmh = (1u32 << (l - 64)) - 1;
+                let c_lo = mm(y0, cm) as u64 | ((mm(y1, cm) as u64) << 32);
+                let c_hi = (mm(y2, cm) & lmh) as u64;
+                let q_lo = mm(y0, qt) as u64 | ((mm(y1, qt) as u64) << 32);
+                let q_hi = (mm(y2, qt) & lmh) as u64;
+                // commas 1..3 from the low word; fields 3..6 in a 64-bit window starting after comma 3
+                let c1 = c_lo.trailing_zeros() as usize;
+                let r1 = c_lo & c_lo.wrapping_sub(1);
+                let r2 = r1 & r1.wrapping_sub(1);
+                let c3 = r2.trailing_zeros() as usize;
+                let _ = c1;
+                if c_lo.count_ones() + c_hi.count_ones() != 6 || c3 >= 63 || l - c3 > 64 {
+                    break 'fast;
+                }
+                let sh = c3 + 1; // 1..=63; the window [sh, sh + 64) holds commas 4..6 and the line end
+                let mk = (1u64 << sh) - 1;
+                let w = (c_lo >> sh) | (c_hi << (64 - sh));
+                let dl = l - sh;
+                let qa = q_lo & mk;
+                let qb = (q_lo >> sh) | (q_hi << (64 - sh));
+                // Per window: m = separators, st = field starts, x = quotes at field starts. m - x
+                // borrows from each x up to its field's separator, so e = m & !(m - x) are the
+                // separators of start-quoted fields and e >> 1 their last chars. Quoting is valid iff
+                // the quotes are exactly x | e >> 1 with no overlap (no 1-char quoted field).
+                let ma = c_lo & mk;
+                let sta = ((ma << 1) | 1) & mk;
+                let xa = qa & sta;
+                let ea = ma & !ma.wrapping_sub(xa);
+                let e1a = ea >> 1;
+                let mb = w | (1u64 << dl);
+                let stb = (w << 1) | 1;
+                let xb = qb & stb;
+                let eb = mb & !mb.wrapping_sub(xb);
+                let e1b = eb >> 1;
+                if ((qa ^ (xa | e1a)) | (xa & e1a) | (qb ^ (xb | e1b)) | (xb & e1b)) != 0 {
+                    break 'fast;
+                }
+                // content starts (after an opening quote) and ends (at the closing quote or separator)
+                let csa = (sta & !xa) | (xa << 1);
+                let cea = (ma & !ea) | e1a;
+                let csb = (stb & !xb) | (xb << 1);
+                let ceb = (mb & !eb) | e1b;
+                let tz = |x: u64| x.trailing_zeros() as usize;
+                let bl = |x: u64| x & x.wrapping_sub(1);
+                let (s0, s1, s2) = (tz(csa), tz(bl(csa)), tz(bl(bl(csa))));
+                let (f0, f1, f2) = (tz(cea), tz(bl(cea)), tz(bl(bl(cea))));
+                let csb1 = bl(csb);
+                let csb2 = bl(csb1);
+                let (s3, s4, s5, s6) = (tz(csb), tz(csb1), tz(csb2), tz(bl(csb2)));
+                let ceb1 = bl(ceb);
+                let ceb2 = bl(ceb1);
+                let (f3, f4, f5, f6) = (tz(ceb), tz(ceb1), tz(ceb2), tz(bl(ceb2)));
+                let pe = lp.add(s0);
+                let ne = f0 - s0;
+                let pu = lp.add(s1);
+                let nu = f1 - s1;
+                let pt = lp.add(s2);
+                let nt = f2 - s2;
+                let pw = lp.add(sh);
+                let pi = pw.add(s3);
+                let ni = f3 - s3;
+                let pk = pw.add(s4);
+                let nk = f4 - s4;
+                let npid = f5 - s5;
+                let ke = ne.wrapping_sub(1);
+                let ku = nu.wrapping_sub(1);
+                let b19 = *pt.add(19);
+                let is1 = (nt == 20) & (b19 == b'Z');
+                let is2 = (nt == 25) & ((b19 == b'+') | (b19 == b'-'));
+                let is3 = nt == 13;
+                if (ke.wrapping_sub(1) >= 8) | (ku.wrapping_sub(1) >= 8) | (*pe != b'e') | (*pu != b'u') | (ni != 20) | !(is1 | is2 | is3) {
+                    break 'fast;
+                }
+                // ---- event and user IDs (two lanes) ----
+                let idx = ke * 9 + ku;
+                let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(pe.add(1) as *const __m128i)), _mm_loadu_si128(pu.add(1) as *const __m128i));
+                let d = _mm256_shuffle_epi8(_mm256_sub_epi8(x, c0), _mm256_load_si256(B36P.0.get_unchecked(idx).0.as_ptr() as *const __m256i));
+                let dig = _mm256_cmpeq_epi8(_mm256_min_epu8(d, c9), d);
+                let lt = _mm256_sub_epi8(d, c49);
+                let let_ = _mm256_cmpeq_epi8(_mm256_min_epu8(lt, c25), lt);
+                let lead = _mm256_and_si256(_mm256_cmpeq_epi8(d, zero), _mm256_load_si256(B36P.1.get_unchecked(idx).0.as_ptr() as *const __m256i));
+                let okid = _mm256_andnot_si256(lead, _mm256_or_si256(dig, let_));
+                let val = _mm256_sub_epi8(d, _mm256_and_si256(let_, c39));
+                let s2 = _mm256_madd_epi16(_mm256_maddubs_epi16(val, w36), w1296);
+                let qe = _mm_cvtsi128_si64(_mm256_castsi256_si128(s2)) as u64;
+                let qu = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(s2)) as u64;
+                let xe = (qe & 0xFFFF_FFFF) * 1_679_616 + (qe >> 32);
+                let xu = (qu & 0xFFFF_FFFF) * 1_679_616 + (qu >> 32);
+                let v = unscr(xe, ekey);
+                let un = unscr(xu, ukey);
+                if _mm256_movemask_epi8(okid) != -1 || (xe | xu) > MASK40 || v >= vb || un >= (1 << 31) {
+                    break 'fast;
+                }
+                // ---- ts (F1/F2 core) and ingest_ts (two lanes) ----
+                let yt = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(pt.add(4) as *const __m128i)), _mm_loadu_si128(pi.add(4) as *const __m128i));
+                let dt = _mm256_sub_epi8(yt, c0);
+                let okd = _mm256_cmpeq_epi8(_mm256_min_epu8(dt, c9), dt);
+                let okp = _mm256_cmpeq_epi8(yt, tpl);
+                let okc = _mm256_movemask_epi8(_mm256_or_si256(_mm256_and_si256(okd, digsel), okp)) as u32;
+                let mw = _mm256_maddubs_epi16(_mm256_shuffle_epi8(dt, pairs), w10);
+                let v0t = std::ptr::read_unaligned(pt as *const u64);
+                let h1 = v0t == lpat1;
+                let mon_t = (v0t == lpat0) | h1;
+                let limv = if h1 { lim1 } else { lim0 };
+                let rng = _mm256_and_si256(_mm256_cmpeq_epi16(_mm256_min_epu16(mw, limv), mw), _mm256_cmpeq_epi16(_mm256_max_epu16(mw, vmin), mw));
+                let rok = _mm256_movemask_epi8(rng) == -1;
+                let sw = _mm256_madd_epi16(mw, w2460);
+                let qtv = _mm_cvtsi128_si64(_mm256_castsi256_si128(sw)) as u64;
+                let qiv = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(sw)) as u64;
+                let v0i = std::ptr::read_unaligned(pi as *const u64);
+                let g1 = v0i == ipat1;
+                if (okc & 0xFFF0_0000) != 0xFFF0_0000 || !((v0i == ipat0) | g1) {
+                    break 'fast;
+                }
+                let ingest_s = ib[g1 as usize] + ((qiv & 0xFFFF_FFFF) as i64 * 3600 + (qiv >> 32) as i64 - 86_400);
+                let mut t12 = lb[h1 as usize] + ((qtv & 0xFFFF_FFFF) as i64 * 3600 + (qtv >> 32) as i64 - 86_400) * 1000;
+                let mut ok12 = mon_t & rok & ((okc & 0x7FF0) == 0x7FF0);
+                if is2 {
+                    // "+HH:MM" at bytes 19..25: subtract the offset to get UTC
+                    let o = std::ptr::read_unaligned(pt.add(17) as *const u64); // S S sign H H : M M
+                    let dd = o.wrapping_sub(0x3030_0030_3000_0000);
+                    let digs = dd & 0xFFFF_00FF_FF00_0000;
+                    let bad = ((digs.wrapping_add(0x7676_0076_7600_0000) | digs) & 0x8080_0080_8000_0000) | (((o >> 40) & 0xFF) ^ 0x3A);
+                    let oh = ((dd >> 24) & 0xFF) * 10 + ((dd >> 32) & 0xFF);
+                    let om = ((dd >> 48) & 0xFF) * 10 + ((dd >> 56) & 0xFF);
+                    ok12 &= (bad == 0) & (oh <= 23) & (om <= 59);
+                    let off = (oh * 60 + om) as i64 * 60_000;
+                    t12 = if b19 == b'+' { t12 - off } else { t12 + off };
+                }
+                // F3 decoded unconditionally and selected without a branch (the form is random per line)
+                let (v3, ok3) = d13_bl(pt);
+                let m3 = (is3 as i64).wrapping_neg();
+                let tr = ((v3 - ws) & m3) | (t12 & !m3);
+                let okt = (ok3 & is3) | (ok12 & !is3);
+                // ---- validity ----
+                let w8 = std::ptr::read_unaligned(pk as *const u64);
+                // type: slot from bits 1..2 of the first byte ('p' 0x70 -> 0, 'c' 0x63 -> 1, 'v' 0x76 -> 3),
+                // then the whole field (bytes beyond its length masked off) and its length must match
+                let slot = ((w8 >> 1) & 3) as usize;
+                let (tw, tn, tt) = *TYPES.get_unchecked(slot);
+                let wm = _bzhi_u64(w8, (nk as u32) << 3);
+                let type_ok = (wm == tw) & (nk == tn);
+                let mut valid = okt & ((tr as u64) < (we_r as u64)) & (ingest_s * 1000 - tr <= DAY) & type_ok & (npid as isize > 0);
+                let ty = tt;
+                let is_pur = ty == 2;
+                let p = (v >> psh) as usize;
+                let vl = (v as u32) & vmask;
+                let (mut pr, mut cat) = (0u32, 0u32);
+                if valid & is_pur {
+                    let pp = pw.add(s6);
+                    let np = f6 - s6;
+                    match parse_price(std::slice::from_raw_parts(pp, np)) {
+                        Some(x) => {
+                            pr = x;
+                            let ppid = pw.add(s5);
+                            cat = cx.products.get_fast(std::slice::from_raw_parts(ppid, npid)).unwrap_or(cx.unknown_cat) as u32;
+                        }
+                        None => valid = false,
+                    }
+                }
+                let typ = if valid { ty } else { 3 };
+                wc.push(p, DRec { meta: vl | (typ << 22), uid: if valid { un as u32 } else { 0 }, ts: if valid { tr as u32 } else { 0 }, ingest: ingest_s as i32 });
+                if typ == 2 {
+                    purs.get_unchecked_mut(p).push(PRec { v_low: vl, price: pr, cat });
+                }
+                ls += l + 1;
+                continue 'line;
+            }
+            nslow += 1;
+            *maxp = (*maxp).max(mp);
+            ls = ev_slow::<K>(buf, ls, e, cx, wc, purs, sparse, maxp);
+            mp = mp.max(*maxp);
+        }
+    }
+    *maxp = (*maxp).max(mp).max(wc.top_nonempty());
+    nslow
+}
+
+/// event types by ((first 8 bytes >> 1) & 3): (field bytes, field length, type); slot 2 never matches
+static TYPES: [(u64, usize, u32); 4] = [
+    (u64::from_le_bytes(*b"purchase"), 8, 2),
+    (u32::from_le_bytes(*b"cart") as u64, 4, 1),
+    (0, usize::MAX, 3),
+    (u32::from_le_bytes(*b"view") as u64, 4, 0),
+];
+
 struct CkCtx<'a> {
     cws: i64,
     we: i64,
@@ -3373,6 +3623,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                         if var & 96 != 0 {
                             let n = match (var & 64 != 0, var & 8 != 0) {
                                 (true, true) if var & 512 != 0 => parse_ev5::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                (true, true) if var & 1024 != 0 => parse_ev6::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (true, true) => parse_ev4::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (true, false) => parse_ev4::<4>(b, s, e, evcx, &mut st.wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (false, true) => parse_ev3::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
@@ -3707,11 +3958,29 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 // (an empty slot has ingest i32::MAX; a copy with that ingest is invalid and can
                 // only lose, so dropping it changes nothing)
                 let dn = st.dense.as_mut_ptr();
+                let pfd = *K_PFD;
                 for sl in parts.iter() {
-                    for r in sl.iter() {
-                        let d = unsafe { &mut *dn.add((r.meta & vmask) as usize) };
-                        if r.ingest < d.ingest {
-                            *d = *r;
+                    if pfd == 0 {
+                        for r in sl.iter() {
+                            let d = unsafe { &mut *dn.add((r.meta & vmask) as usize) };
+                            if r.ingest < d.ingest {
+                                *d = *r;
+                            }
+                        }
+                    } else {
+                        // the slots are scattered over the dense array: fetch them a few records ahead
+                        let n = sl.len();
+                        let sp = sl.as_ptr();
+                        unsafe {
+                            for i in 0..n {
+                                let j = (i + pfd).min(n - 1);
+                                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(dn.add(((*sp.add(j)).meta & vmask) as usize) as *const i8);
+                                let r = &*sp.add(i);
+                                let d = &mut *dn.add((r.meta & vmask) as usize);
+                                if r.ingest < d.ingest {
+                                    *d = *r;
+                                }
+                            }
                         }
                     }
                 }
@@ -4493,12 +4762,14 @@ pub(crate) fn fuzz_ev(iters: usize) {
         let (mut sa, mut sb): (Vec<SRec>, Vec<SRec>) = (vec![], vec![]);
         let (mut ma, mut mb) = (0usize, 0usize);
         parse_ev::<0, 4>(&buf, 0, e, &cx, &mut wa, &mut pa, &mut sa, &mut ma);
-        if it % 3 == 0 {
+        if it % 4 == 0 {
             total_slow += parse_ev3::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
-        } else if it % 3 == 1 {
+        } else if it % 4 == 1 {
             total_slow += parse_ev4::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
-        } else {
+        } else if it % 4 == 2 {
             total_slow += parse_ev5::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
+        } else {
+            total_slow += parse_ev6::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
         }
         let (oa, ob) = (wa.finish(), wb.finish());
         let dk = |r: &DRec| (r.meta, r.uid, r.ts, r.ingest);
@@ -4524,12 +4795,14 @@ pub(crate) fn fuzz_ev(iters: usize) {
                     let (mut s1, mut s2): (Vec<SRec>, Vec<SRec>) = (vec![], vec![]);
                     let (mut m1, mut m2) = (0usize, 0usize);
                     parse_ev::<0, 4>(&one, 0, ee, &cx, &mut w1, &mut p1, &mut s1, &mut m1);
-                    if it % 3 == 0 {
+                    if it % 4 == 0 {
                         parse_ev3::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
-                    } else if it % 3 == 1 {
+                    } else if it % 4 == 1 {
                         parse_ev4::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
-                    } else {
+                    } else if it % 4 == 2 {
                         parse_ev5::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
+                    } else {
+                        parse_ev6::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
                     }
                     let (o1, o2) = (w1.finish(), w2.finish());
                     let r1: Vec<_> = o1.iter().flatten().map(dk).collect();
