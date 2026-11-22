@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 static K_VAR: LazyLock<u32> = LazyLock::new(|| knob("SESS_VAR", 0) as u32);
 static K_CHUNK: LazyLock<usize> = LazyLock::new(|| knob("SESS_CHUNK", 1 << 20));
+static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 0) != 0);
 static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1024).max(16));
 static K_SEGF: LazyLock<usize> = LazyLock::new(|| knob("SESS_SEGF", 4).max(1));
 pub(crate) const MASK40: u64 = (1 << 40) - 1;
@@ -1469,6 +1470,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
 
     // ---- files ----
     let mut files: Vec<(File, u64)> = vec![];
+    let mut maps: Vec<Option<memmap2::Mmap>> = vec![];
     let mut chunks: Vec<Chunk> = vec![];
     let mut lchunks: Vec<Chunk> = vec![];
     let mut total_ev: u64 = 0;
@@ -1495,6 +1497,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                     biggest_ck = Some(fi);
                 }
             }
+            maps.push(if *K_MAP2 && kind != Kind::Ln { unsafe { memmap2::Mmap::map(&f) }.ok() } else { None });
             files.push((f, len));
             let step = (*K_CHUNK as u64).max(4096);
             let mut s = 0;
@@ -1686,8 +1689,24 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             |st, t| {
                 let c = &chunks[t];
                 let (f, len) = &files[c.file];
-                let (s, e) = read_chunk(f, *len, c, &mut st.buf);
-                let b = &st.buf[..];
+                let (b, s, e): (&[u8], usize, usize) = match &maps[c.file] {
+                    Some(mm) => {
+                        let m = &mm[..];
+                        let (s0, e0) = chunk_lines(m, c);
+                        if e0 + 128 <= m.len() {
+                            (m, s0, e0)
+                        } else {
+                            st.buf.clear();
+                            st.buf.extend_from_slice(&m[s0..e0]);
+                            st.buf.resize(e0 - s0 + 128, 0);
+                            (&st.buf[..], 0, e0 - s0)
+                        }
+                    }
+                    None => {
+                        let (s, e) = read_chunk(f, *len, c, &mut st.buf);
+                        (&st.buf[..], s, e)
+                    }
+                };
                 match c.kind {
                     Kind::Ev => {
                         let var = *K_VAR;
@@ -1757,6 +1776,12 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         s.ck = w.finish();
     }
     drop(lparts);
+    // unmap the inputs on several threads (one serial teardown at exit otherwise)
+    std::thread::scope(|sc| {
+        for m in maps.drain(..).flatten() {
+            sc.spawn(move || drop(m));
+        }
+    });
     if std::env::var("FAST_PARSEONLY").is_ok() {
         std::process::exit(0);
     }
