@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::sync::{LazyLock, Mutex};
 
 mod fast;
+mod pq;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -843,7 +844,14 @@ fn low_mask(k: usize) -> u64 {
 
 /// Iterates rows of buf[s..e]. buf must have at least 128 readable bytes past e.
 #[inline(always)]
-fn for_rows_fast<const N: usize>(buf: &[u8], s: usize, e: usize, mut g: impl FnMut([&[u8]; N])) {
+fn for_rows_fast<const N: usize>(buf: &[u8], s: usize, e: usize, g: impl FnMut([&[u8]; N])) {
+    for_rows_fast_v::<N, 0>(buf, s, e, g)
+}
+
+/// V bit 1: commas extracted without data-dependent loop exits; V bit 2: quote validation also
+/// for lines without quotes (no branch on the quote count)
+#[inline(always)]
+fn for_rows_fast_v<const N: usize, const V: u32>(buf: &[u8], s: usize, e: usize, mut g: impl FnMut([&[u8]; N])) {
     assert!(buf.len() >= e + 128);
     let mut ls = s;
     let mut f = [(0usize, 0usize); N];
@@ -886,24 +894,39 @@ fn for_rows_fast<const N: usize>(buf: &[u8], s: usize, e: usize, mut g: impl FnM
         if (mc[0].count_ones() + mc[1].count_ones()) as usize == N - 1 {
             // field end offsets
             let mut ends = [0usize; N];
-            let mut k = 0;
-            let mut c0 = mc[0];
-            while c0 != 0 {
-                ends[k] = c0.trailing_zeros() as usize;
-                c0 &= c0 - 1;
-                k += 1;
-            }
-            let mut c1 = mc[1];
-            while c1 != 0 {
-                ends[k] = 64 + c1.trailing_zeros() as usize;
-                c1 &= c1 - 1;
-                k += 1;
+            if V & 1 != 0 {
+                // exactly N-1 commas: extract them without data-dependent loop exits
+                let (mut w0, mut w1) = (mc[0], mc[1]);
+                for k in 0..N - 1 {
+                    let p0 = w0.trailing_zeros() as usize;
+                    let p1 = 64 + w1.trailing_zeros() as usize;
+                    let use0 = w0 != 0;
+                    ends[k] = if use0 { p0 } else { p1 };
+                    let b0 = w0 & w0.wrapping_sub(1);
+                    let b1 = w1 & w1.wrapping_sub(1);
+                    w0 = if use0 { b0 } else { w0 };
+                    w1 = if use0 { w1 } else { b1 };
+                }
+            } else {
+                let mut k = 0;
+                let mut c0 = mc[0];
+                while c0 != 0 {
+                    ends[k] = c0.trailing_zeros() as usize;
+                    c0 &= c0 - 1;
+                    k += 1;
+                }
+                let mut c1 = mc[1];
+                while c1 != 0 {
+                    ends[k] = 64 + c1.trailing_zeros() as usize;
+                    c1 &= c1 - 1;
+                    k += 1;
+                }
             }
             ends[N - 1] = le_off;
             let lp = unsafe { base.add(ls) };
             let mut a: [&[u8]; N] = [&[]; N];
             let nq = mq[0].count_ones() + mq[1].count_ones();
-            if nq == 0 {
+            if V & 2 == 0 && nq == 0 {
                 let mut fs = 0usize;
                 for k in 0..N {
                     let fe = ends[k];
@@ -1286,6 +1309,7 @@ struct Ck {
     camp: u16,
 }
 
+#[derive(Clone)]
 struct UserRow {
     person: u64,
     day: i32,
@@ -1354,12 +1378,12 @@ struct Wc<T: Copy, const K: usize> {
 }
 impl<T: Copy + Default, const K: usize> Wc<T, K> {
     fn new(nb: usize, cap: usize) -> Self {
-        assert!(std::mem::size_of::<T>() * K == 64 && std::mem::align_of::<T>() >= 16);
+        assert!((std::mem::size_of::<T>() * K) % 64 == 0 && std::mem::align_of::<T>() >= 16);
         Wc { out: buckets_n(nb, cap), st: vec![[T::default(); K]; nb], n: vec![0; nb] }
     }
     /// only the first `used` buckets get the capacity up front
     fn new_n(nb: usize, cap: usize, used: usize) -> Self {
-        assert!(std::mem::size_of::<T>() * K == 64 && std::mem::align_of::<T>() >= 16);
+        assert!((std::mem::size_of::<T>() * K) % 64 == 0 && std::mem::align_of::<T>() >= 16);
         Wc { out: (0..nb).map(|i| Vec::with_capacity(if i < used { cap } else { 0 })).collect(), st: vec![[T::default(); K]; nb], n: vec![0; nb] }
     }
     #[inline(always)]
@@ -1387,12 +1411,12 @@ impl<T: Copy + Default, const K: usize> Wc<T, K> {
             #[cfg(target_arch = "x86_64")]
             {
                 use std::arch::x86_64::*;
-                for i in 0..4 {
+                for i in 0..(K * std::mem::size_of::<T>() / 16) {
                     _mm_stream_si128(dst.add(16 * i) as *mut __m128i, _mm_load_si128(src.add(16 * i) as *const __m128i));
                 }
             }
             #[cfg(not(target_arch = "x86_64"))]
-            std::ptr::copy_nonoverlapping(src, dst, 64);
+            std::ptr::copy_nonoverlapping(src, dst, K * std::mem::size_of::<T>());
             v.set_len(len + K);
             *self.n.get_unchecked_mut(b) = 0;
         }
@@ -1506,7 +1530,13 @@ fn fuzz_rows() {
         let mut buf = chunk.clone();
         for _ in 0..128 { buf.push((next() & 0xff) as u8); }
         let mut fast: Vec<Vec<Vec<u8>>> = vec![];
-        if std::env::var("FUZZ2").is_ok() { for_rows_fast2::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())); } else { for_rows_fast::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())); }
+        match it % 5 {
+            0 => for_rows_fast_v::<7, 0>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+            1 => for_rows_fast_v::<7, 1>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+            2 => for_rows_fast_v::<7, 2>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+            3 => for_rows_fast_v::<7, 3>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+            _ => for_rows_fast2::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+        }
         let mut slow: Vec<Vec<Vec<u8>>> = vec![];
         let mut f = [(0usize, 0usize); 7];
         let mut i = 0;
@@ -1543,6 +1573,12 @@ fn main() {
         }
     }
     if std::env::var("FUZZ").is_ok() { fuzz(); return; }
+    if std::env::var("FAST_FUZZ").is_ok() { fast::fuzz_fast(); return; }
+    if let Ok(d) = std::env::var("PQ_TEST") { fast::pq_empty_test(Path::new(&d)); return; }
+    if let Ok(w) = std::env::var("FAST_BENCH") {
+        fast::bench(w.parse().unwrap_or(0), &PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into())));
+        return;
+    }
     if std::env::var("FAST_FUZZ").is_ok() { fast::fuzz_fast(); return; }
     if let Ok(w) = std::env::var("FAST_BENCH") {
         fast::bench(w.parse().unwrap_or(0), &PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into())));

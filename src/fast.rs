@@ -7,7 +7,10 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-static K_MODE: LazyLock<u32> = LazyLock::new(|| knob("FAST_MODE", 0) as u32);
+static K_VAR: LazyLock<u32> = LazyLock::new(|| knob("SESS_VAR", 0) as u32);
+static K_CHUNK: LazyLock<usize> = LazyLock::new(|| knob("SESS_CHUNK", 1 << 20));
+static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1024).max(16));
+static K_SEGF: LazyLock<usize> = LazyLock::new(|| knob("SESS_SEGF", 4).max(1));
 pub(crate) const MASK40: u64 = (1 << 40) - 1;
 const A0: u64 = 0x9E37_79B9_7F4B;
 const A1: u64 = 0xD6E8_FEB8_6659;
@@ -265,6 +268,75 @@ unsafe fn f2_tab(p: *const u8, t: &MonTab) -> Option<i64> {
         let off = (oh * 60 + om) as i64 * 60_000;
         let local = base + ((dd as i64 - 1) * 86_400 + hh as i64 * 3600 + mi as i64 * 60 + ss as i64) * 1000;
         Some(if sign == b'+' as u64 { local - off } else { local + off })
+    }
+}
+
+/// f1_tab without branches: (ms, ok)
+#[inline(always)]
+unsafe fn f1_bl(p: *const u8, t: &MonTab) -> (i64, bool) {
+    unsafe {
+        let v0 = std::ptr::read_unaligned(p as *const u64);
+        let h0 = v0 == t.m[0].0;
+        let h1 = v0 == t.m[1].0;
+        let base = if h0 { t.m[0].1 } else { t.m[1].1 };
+        let dim = if h0 { t.m[0].2 } else { t.m[1].2 };
+        let v1 = std::ptr::read_unaligned(p.add(8) as *const u64);
+        let v2 = std::ptr::read_unaligned(p.add(16) as *const u32) as u64;
+        const DM1: u64 = 0xFFFF_00FF_FF00_FFFF;
+        let d1 = (v1 & DM1).wrapping_sub(0x3030_0030_3000_3030);
+        let d2v = (v2 & 0x00FF_FF00).wrapping_sub(0x0030_3000);
+        let bad = ((d1.wrapping_add(0x7676_7676_7676_7676) | d1 | d2v.wrapping_add(0x0076_7600) | d2v) & HI8)
+            | ((v1 & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_0054_0000)
+            | ((v2 & 0xFF00_00FF) ^ 0x5A00_003A);
+        let p1 = d1.wrapping_mul(10).wrapping_add(d1 >> 8);
+        let p2 = d2v.wrapping_mul(10).wrapping_add(d2v >> 8);
+        let dd = p1 & 0xFF;
+        let hh = (p1 >> 24) & 0xFF;
+        let mi = (p1 >> 48) & 0xFF;
+        let ss = (p2 >> 8) & 0xFF;
+        let over = (dim as u64).wrapping_sub(dd) | 23u64.wrapping_sub(hh) | 59u64.wrapping_sub(mi) | 59u64.wrapping_sub(ss) | dd.wrapping_sub(1);
+        let ok = (h0 | h1) & ((bad | (over & (1 << 63))) == 0);
+        (base + ((dd as i64 - 1) * 86_400 + hh as i64 * 3600 + mi as i64 * 60 + ss as i64) * 1000, ok)
+    }
+}
+
+/// digits13 without branches: (value, ok)
+#[inline(always)]
+unsafe fn d13_bl(p: *const u8) -> (i64, bool) {
+    unsafe {
+        let raw = _mm_loadu_si128(p as *const __m128i);
+        let sh = _mm_slli_si128(raw, 3);
+        let x = _mm_or_si128(sh, _mm_setr_epi8(0x30, 0x30, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+        let d = _mm_sub_epi8(x, _mm_set1_epi8(0x30));
+        let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) == 0xFFFF;
+        let a = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
+        let b = _mm_madd_epi16(a, _mm_set1_epi32(0x0001_0064));
+        let c = _mm_packus_epi32(b, b);
+        let e = _mm_madd_epi16(c, _mm_set1_epi32(0x0001_2710));
+        let q = _mm_cvtsi128_si64(e) as u64;
+        (((q & 0xFFFF_FFFF) * 100_000_000 + (q >> 32)) as i64, ok)
+    }
+}
+
+/// ts_win with V bit 4: F1 and F3 both decoded and selected without branches
+#[inline(always)]
+unsafe fn ts_win_v<const V: u32>(b: &[u8], win: &MonTab, loc: &MonTab) -> Option<i64> {
+    unsafe {
+        if V & 4 == 0 {
+            return ts_win(b, win, loc);
+        }
+        let n = b.len();
+        let p = b.as_ptr();
+        let (v1, ok1) = f1_bl(p, win);
+        let (v3, ok3) = d13_bl(p);
+        let is1 = (n == 20) & (*p.add(4) == b'-');
+        let is3 = n == 13;
+        if is1 | is3 {
+            let v = if is1 { v1 } else { v3 };
+            let ok = if is1 { ok1 } else { ok3 };
+            return if ok { Some(v) } else { None };
+        }
+        parse_ts_fast(b)
     }
 }
 
@@ -685,6 +757,7 @@ struct SessSc {
     covered: Vec<(u32, u32)>,
     pstamp: u32,
     cts: Vec<i64>,
+    s_nxt: Vec<u32>,
 }
 
 /// ev: one person's events sorted by ts; cl: the person's valid clicks sorted by ts.
@@ -793,6 +866,12 @@ fn sess_one(name: u64, ev: &[UEv], cl: &[Ck], cx: &SessCx, sc: &mut SessSc, user
         sc.pstamp += 1;
         let pstamp = sc.pstamp;
         let ns = sc.s_start.len();
+        // s_nxt[i]: first session after i on a later day
+        sc.s_nxt.clear();
+        sc.s_nxt.resize(ns, ns as u32);
+        for i in (0..ns.saturating_sub(1)).rev() {
+            sc.s_nxt[i] = if sc.s_day[i + 1] != sc.s_day[i] { (i + 1) as u32 } else { sc.s_nxt[i + 1] };
+        }
         let (mut lo, mut hi) = (0usize, 0usize);
         for (c, &t) in cl.iter().zip(cts.iter()) {
             while lo < ns && sc.s_start[lo] < t {
@@ -811,10 +890,7 @@ fn sess_one(name: u64, ev: &[UEv], cl: &[Ck], cx: &SessCx, sc: &mut SessSc, user
             let mut x = from;
             while x < hi {
                 let d = sc.s_day[x];
-                let mut y = x + 1;
-                while y < hi && sc.s_day[y] == d {
-                    y += 1;
-                }
+                let y = (sc.s_nxt[x] as usize).min(hi);
                 camp_out[kc * ndays + d][3] += (y - x) as i64;
                 x = y;
             }
@@ -853,6 +929,20 @@ struct Out {
     side: Vec<(u64, UEv)>,
 }
 
+#[inline(never)]
+fn look_slow(uid: u32, plist: &mut Vec<(u64, bool)>, cache: &mut Vec<(u32, u16)>, pers: &Persons) -> u16 {
+    let (p, c) = pers.of(uid);
+    let i = match plist.iter().position(|x| x.0 == p) {
+        Some(i) => i,
+        None => {
+            plist.push((p, c));
+            plist.len() - 1
+        }
+    } as u16;
+    cache.push((uid, i));
+    i
+}
+
 /// All events of user u (in event-index order), plus its sparse events; complex persons go to the side.
 fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &mut Out) {
     if (sh.sparse_bits[(u >> 6) as usize] >> (u & 63)) & 1 != 0 {
@@ -866,28 +956,23 @@ fn finish_user(u: u32, evs: &mut Vec<UEv>, sh: &Shared, us: &mut UserSc, out: &m
     us.pidx.clear();
     us.cache.clear();
     let pers = sh.pers;
-    let mut look = |uid: u32, us_plist: &mut Vec<(u64, bool)>, cache: &mut Vec<(u32, u16)>| -> u16 {
+    let look = |uid: u32, us_plist: &mut Vec<(u64, bool)>, cache: &mut Vec<(u32, u16)>| -> u16 {
         for &(k, i) in cache.iter() {
             if k == uid {
                 return i;
             }
         }
-        let (p, c) = pers.of(uid);
-        let i = match us_plist.iter().position(|x| x.0 == p) {
-            Some(i) => i,
-            None => {
-                us_plist.push((p, c));
-                us_plist.len() - 1
-            }
-        } as u16;
-        cache.push((uid, i));
-        i
+        look_slow(uid, us_plist, cache, pers)
     };
     let mut multi = false;
+    let (mut lu, mut li) = (u32::MAX, 0u16);
     for e in evs.iter() {
-        let i = look(e.uid, &mut us.plist, &mut us.cache);
-        multi |= i != 0;
-        us.pidx.push(i);
+        if e.uid != lu {
+            lu = e.uid;
+            li = look(e.uid, &mut us.plist, &mut us.cache);
+        }
+        multi |= li != 0;
+        us.pidx.push(li);
     }
     if us.plist.len() > 30000 {
         // pathological: group through the side path instead
@@ -979,6 +1064,95 @@ fn run_map<S: Send, R: Send>(nt: usize, ntasks: usize, init: impl Fn(usize) -> S
         *slots[t].lock().unwrap() = Some(r);
     });
     (st, slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect())
+}
+
+struct EvCtx<'a> {
+    ws: i64,
+    we: i64,
+    ukey: u64,
+    ekey: u64,
+    vb: u64,
+    psh: u32,
+    vmask: u32,
+    evwin: &'a MonTab,
+    evloc: &'a MonTab,
+    ingtab: &'a MonTab,
+    products: &'a IdTable,
+    unknown_cat: u16,
+}
+
+/// Parses event lines b[s..e) into the partition write-combiner. V selects code variants.
+#[inline(never)]
+fn parse_ev<const V: u32, const K: usize>(b: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) {
+    let (ws, we, ukey, ekey, vb, psh, vmask) = (cx.ws, cx.we, cx.ukey, cx.ekey, cx.vb, cx.psh, cx.vmask);
+    let (evwin, evloc, ingtab, products, unknown_cat) = (cx.evwin, cx.evloc, cx.ingtab, cx.products, cx.unknown_cat);
+    for_rows_fast_v::<7, V>(b, s, e, #[inline(always)] |[eid, uid, ts, ing, et, pid, price]| {
+        if eid.is_empty() {
+            return;
+        }
+        let ingest_s = unsafe { ingest_win(ing, ingtab, ws) };
+        let ingest = ingest_s as i32;
+        let mut typ = 3u32;
+        let mut tsr = 0u32;
+        let mut pr = 0u32;
+        let mut cat = 0u32;
+        'v: {
+            if uid.is_empty() || pid.is_empty() {
+                break 'v;
+            }
+            let Some(t) = (unsafe { ts_win_v::<V>(ts, evwin, evloc) }) else { break 'v };
+            // late: ingest - ts > 24 h (an unparseable ingest counts as late)
+            if t < ws || t >= we || ingest_s == i32::MAX as i64 || (ingest_s * 1000 + ws) - t > DAY {
+                break 'v;
+            }
+            let ty = match et.len() {
+                4 => {
+                    let w = u32::from_le_bytes(et.try_into().unwrap());
+                    let is_cart = w == u32::from_le_bytes(*b"cart");
+                    if !(is_cart | (w == u32::from_le_bytes(*b"view"))) {
+                        break 'v;
+                    }
+                    is_cart as u32
+                }
+                8 => {
+                    if u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+                        2
+                    } else {
+                        break 'v;
+                    }
+                }
+                _ => break 'v,
+            };
+            if ty == 2 {
+                match parse_price(price) {
+                    Some(p) => pr = p,
+                    None => break 'v,
+                }
+                cat = products.get(pid).unwrap_or(unknown_cat) as u32;
+            }
+            tsr = (t - ws) as u32;
+            typ = ty;
+        }
+        let u = if typ != 3 { unsafe { dec_uid(uid, ukey) } } else { 0 };
+        let v = match unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) } {
+            Some(x) => unscr(x, ekey),
+            None => u64::MAX,
+        };
+        if v < vb {
+            let p = (v >> psh) as usize;
+            let vl = (v as u32) & vmask;
+            wc.push(p, DRec { meta: vl | (typ << 22), uid: u, ts: tsr, ingest });
+            if typ == 2 {
+                unsafe { purs.get_unchecked_mut(p) }.push(PRec { v_low: vl, price: pr, cat });
+            }
+            if p > *maxp {
+                *maxp = p;
+            }
+        } else {
+            let k = unsafe { key_fast(eid) };
+            sparse.push(SRec { eid: k, rec: DRec { meta: typ << 22, uid: u, ts: tsr, ingest }, price: pr, cat });
+        }
+    });
 }
 
 pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str)) -> Result<(), String> {
@@ -1093,7 +1267,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 total_ck += len;
             }
             files.push((f, len));
-            let step = 1 << 20;
+            let step = (*K_CHUNK as u64).max(4096);
             let mut s = 0;
             while s < len {
                 let e = (s + step).min(len);
@@ -1165,7 +1339,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let vb = est_lines * 3 / 2 + 4096;
     let psh = {
         let mut s = 10u32;
-        while (vb >> s) > 1024 {
+        while (vb >> s) > *K_PARTS as u64 {
             s += 1;
         }
         s
@@ -1208,6 +1382,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     struct SA {
         buf: Vec<u8>,
         wc: Wc<DRec, 4>,
+        wc8: Wc<DRec, 8>,
         purs: Vec<Vec<PRec>>,
         sparse: Vec<SRec>,
         wck: Wc<Ck, 2>,
@@ -1218,6 +1393,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     }
     let products = &products;
     let campaigns = &campaigns;
+    let evcx = &EvCtx { ws, we, ukey, ekey, vb, psh, vmask, evwin, evloc, ingtab, products, unknown_cat };
     let (pers, sa) = std::thread::scope(|scope| {
         let lparts = &lparts;
         let uf = scope.spawn(move || build_persons(lparts));
@@ -1226,7 +1402,8 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             chunks.len(),
             |_| SA {
                 buf: vec![],
-                wc: Wc::new_n(nparts, cap, nparts),
+                wc: if *K_VAR & 8 == 0 { Wc::new_n(nparts, cap, nparts) } else { Wc::empty() },
+                wc8: if *K_VAR & 8 != 0 { Wc::new_n(nparts, cap, nparts) } else { Wc::empty() },
                 purs: (0..nparts).map(|_| Vec::new()).collect(),
                 sparse: vec![],
                 wck: Wc::new_n(NCQ, cap_ck, ncq_used),
@@ -1242,93 +1419,29 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 let b = &st.buf[..];
                 match c.kind {
                     Kind::Ev => {
-                        let wc = &mut st.wc;
-                        let purs = &mut st.purs;
-                        let sparse = &mut st.sparse;
-                        let maxp = &mut st.maxp;
-                        let mode = *K_MODE;
-                        if mode == 9 {
-                            return;
+                        let var = *K_VAR;
+                        if var & 8 != 0 {
+                            let wc = &mut st.wc8;
+                            match var & 7 {
+                                0 => parse_ev::<0, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                1 => parse_ev::<1, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                3 => parse_ev::<3, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                5 => parse_ev::<5, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                _ => parse_ev::<7, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                            }
+                        } else {
+                            let wc = &mut st.wc;
+                            match var & 7 {
+                                0 => parse_ev::<0, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                1 => parse_ev::<1, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                2 => parse_ev::<2, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                3 => parse_ev::<3, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                4 => parse_ev::<4, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                5 => parse_ev::<5, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                6 => parse_ev::<6, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                _ => parse_ev::<7, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                            }
                         }
-                        for_rows_fast::<7>(b, s, e, #[inline(always)] |[eid, uid, ts, ing, et, pid, price]| {
-                            if eid.is_empty() {
-                                return;
-                            }
-                            if mode != 0 {
-                                use std::hint::black_box as bb;
-                                if mode == 1 { bb(eid.len() + uid.len() + ts.len() + ing.len() + et.len() + pid.len() + price.len()); return; }
-                                if mode >= 2 { bb(unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) }.map(|x| unscr(x, ekey))); }
-                                if mode >= 3 { bb(unsafe { dec_uid(uid, ukey) }); }
-                                if mode >= 4 { bb(unsafe { ts_win(ts, evwin, evloc) }); }
-                                if mode >= 5 { bb(unsafe { ingest_win(ing, ingtab, ws) }); }
-                                if mode >= 6 { bb(unsafe { key_fast(eid) }); bb(unsafe { key_fast(uid) }); }
-                                return;
-                            }
-                            let ingest_s = unsafe { ingest_win(ing, ingtab, ws) };
-                            let ingest = ingest_s as i32;
-                            let mut typ = 3u32;
-                            let mut tsr = 0u32;
-                            let mut pr = 0u32;
-                            let mut cat = 0u32;
-                            'v: {
-                                if uid.is_empty() || pid.is_empty() {
-                                    break 'v;
-                                }
-                                let Some(t) = (unsafe { ts_win(ts, evwin, evloc) }) else { break 'v };
-                                // late: ingest - ts > 24 h (an unparseable ingest counts as late)
-                                if t < ws || t >= we || ingest_s == i32::MAX as i64 || (ingest_s * 1000 + ws) - t > DAY {
-                                    break 'v;
-                                }
-                                let ty = match et.len() {
-                                    4 => {
-                                        let w = u32::from_le_bytes(et.try_into().unwrap());
-                                        if w == u32::from_le_bytes(*b"view") {
-                                            0
-                                        } else if w == u32::from_le_bytes(*b"cart") {
-                                            1
-                                        } else {
-                                            break 'v;
-                                        }
-                                    }
-                                    8 => {
-                                        if u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
-                                            2
-                                        } else {
-                                            break 'v;
-                                        }
-                                    }
-                                    _ => break 'v,
-                                };
-                                if ty == 2 {
-                                    match parse_price(price) {
-                                        Some(p) => pr = p,
-                                        None => break 'v,
-                                    }
-                                    cat = products.get(pid).unwrap_or(unknown_cat) as u32;
-                                }
-                                tsr = (t - ws) as u32;
-                                typ = ty;
-                            }
-                            let u = if typ != 3 { unsafe { dec_uid(uid, ukey) } } else { 0 };
-                            let v = match unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) } {
-                                Some(x) => unscr(x, ekey),
-                                None => u64::MAX,
-                            };
-                            if v < vb {
-                                let p = (v >> psh) as usize;
-                                let vl = (v as u32) & vmask;
-                                wc.push(p, DRec { meta: vl | (typ << 22), uid: u, ts: tsr, ingest });
-                                if typ == 2 {
-                                    unsafe { purs.get_unchecked_mut(p) }.push(PRec { v_low: vl, price: pr, cat });
-                                }
-                                if p > *maxp {
-                                    *maxp = p;
-                                }
-                            } else {
-                                let k = unsafe { key_fast(eid) };
-                                sparse.push(SRec { eid: k, rec: DRec { meta: typ << 22, uid: u, ts: tsr, ingest }, price: pr, cat });
-                            }
-                        });
                     }
                     Kind::Ck => {
                         let wck = &mut st.wck;
@@ -1359,8 +1472,13 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     });
     let mut sa = sa;
     for s in sa.iter_mut() {
-        let w = std::mem::replace(&mut s.wc, Wc::empty());
-        s.ev = w.finish();
+        if *K_VAR & 8 != 0 {
+            let w = std::mem::replace(&mut s.wc8, Wc::empty());
+            s.ev = w.finish();
+        } else {
+            let w = std::mem::replace(&mut s.wc, Wc::empty());
+            s.ev = w.finish();
+        }
         let w = std::mem::replace(&mut s.wck, Wc::empty());
         s.ck = w.finish();
     }
@@ -1468,7 +1586,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         scx: SessCx { ws, cws, ndays, organic, cat_rank: &cat_rank },
     };
     let np = maxp + 1;
-    let nseg = (nt * 4).min(np).max(1);
+    let nseg = (nt * *K_SEGF).min(np).max(1);
     let seg_lo = |s: usize| s * np / nseg;
     struct SB {
         slot: Vec<u32>,
@@ -1724,7 +1842,13 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             let ud = &ud;
             let cat_names = &cat_names;
             let gg = g;
-            scope.spawn(move || write_user(&ud.join(format!("part-{gg:03}.parquet")), &o.rows, cat_names));
+            scope.spawn(move || {
+                if std::env::var_os("SESS_OLDPQ").is_some() {
+                    write_user(&ud.join(format!("part-{gg:03}.parquet")), &o.rows, cat_names)
+                } else {
+                    write_user_pq(&ud.join(format!("part-{gg:03}.parquet")), &o.rows, cat_names).unwrap()
+                }
+            });
             g += 1;
         }
         let mut c_id = vec![];
@@ -1742,7 +1866,11 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 }
             }
         }
-        write_camp(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v);
+        if std::env::var_os("SESS_OLDPQ").is_some() {
+            write_camp(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v);
+        } else {
+            write_camp_pq(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v).unwrap();
+        }
     });
     log("done");
     Ok(())
@@ -1927,4 +2055,73 @@ pub(crate) fn fuzz_fast() {
         b.clear();
     }
     eprintln!("fuzz_fast done, mismatches: {bad}");
+}
+
+
+fn write_user_pq(path: &Path, rows: &[UserRow], cat_names: &[Vec<u8>]) -> std::io::Result<()> {
+    use crate::pq::{Col, Kind as K};
+    let n = rows.len();
+    let mut uid = Col::new("user_id", K::Str, n * 13);
+    let mut day = Col::new("day", K::Date, n * 4);
+    let mut ses = Col::new("sessions", K::I64, n * 8);
+    let mut evc = Col::new("events", K::I64, n * 8);
+    let mut rev = Col::new("revenue_cents", K::I64, n * 8);
+    let mut top = Col::new("top_category", K::OptStr, n * 6);
+    top.defs.reserve(n);
+    for r in rows {
+        let k = r.person;
+        if k & FALLBACK == 0 {
+            let mut b = [0u8; 9];
+            let mut len = 0;
+            while len < 9 {
+                let c = ((k >> (7 * (8 - len))) & 0x7F) as u8;
+                if c == 0 {
+                    break;
+                }
+                b[len] = c;
+                len += 1;
+            }
+            uid.put_str(&b[..len]);
+        } else {
+            uid.put_str(&key_bytes(k));
+        }
+        day.put_i32(r.day);
+        ses.put_i64(r.sessions);
+        evc.put_i64(r.events);
+        rev.put_i64(r.revenue);
+        match r.top {
+            Some(t) => top.put_str(&cat_names[t as usize]),
+            None => top.put_null(),
+        }
+    }
+    crate::pq::write(path, n, &[uid, day, ses, evc, rev, top])
+}
+
+fn write_camp_pq(path: &Path, ids: &[Vec<u8>], ch: &[Vec<u8>], day: &[i32], v: &[[i64; 4]]) -> std::io::Result<()> {
+    use crate::pq::{Col, Kind as K};
+    let n = ids.len();
+    let mut c0 = Col::new("campaign_id", K::Str, n * 12);
+    let mut c1 = Col::new("channel", K::Str, n * 12);
+    let mut c2 = Col::new("day", K::Date, n * 4);
+    let mut c3 = Col::new("sessions", K::I64, n * 8);
+    let mut c4 = Col::new("purchasing_sessions", K::I64, n * 8);
+    let mut c5 = Col::new("revenue_cents", K::I64, n * 8);
+    let mut c6 = Col::new("assisted_sessions", K::I64, n * 8);
+    for i in 0..n {
+        c0.put_str(&ids[i]);
+        c1.put_str(&ch[i]);
+        c2.put_i32(day[i]);
+        c3.put_i64(v[i][0]);
+        c4.put_i64(v[i][1]);
+        c5.put_i64(v[i][2]);
+        c6.put_i64(v[i][3]);
+    }
+    crate::pq::write(path, n, &[c0, c1, c2, c3, c4, c5, c6])
+}
+
+pub(crate) fn pq_empty_test(dir: &Path) {
+    write_user_pq(&dir.join("u.parquet"), &[], &[]).unwrap();
+    write_camp_pq(&dir.join("c.parquet"), &[], &[], &[], &[]).unwrap();
+    let rows = vec![UserRow { person: key(b"u1"), day: 20000, sessions: 1, events: 2, revenue: 0, top: None }; 17];
+    write_user_pq(&dir.join("n.parquet"), &rows, &[b"x".to_vec()]).unwrap();
 }
