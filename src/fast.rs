@@ -2559,6 +2559,267 @@ fn parse_ck2(buf: &[u8], s: usize, e: usize, cx: &CkCtx, wck: &mut Wc<C16, 4>, s
     nslow
 }
 
+/// parse_ev4 split into two passes over batches of lines (fewer values live at once): pass 1
+/// finds each line's end and its seven field contents (offsets within the line), pass 2 decodes
+/// them and writes the records. Lines either pass rejects go through ev_slow, in order.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn parse_ev5<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) -> usize {
+    const B: usize = 64;
+    const SLOW: u8 = 0xFF;
+    assert!(buf.len() >= e + 128);
+    let mut nslow = 0usize;
+    let mut lsv = [0u32; B];
+    let mut pos = [[0u8; 16]; B];
+    unsafe {
+        let base = buf.as_ptr();
+        let (ws, we, ukey, ekey, vb, psh, vmask) = (cx.ws, cx.we, cx.ukey, cx.ekey, cx.vb, cx.psh, cx.vmask);
+        let loc = cx.evloc;
+        let itb = cx.ingtab;
+        let (lpat0, lpat1) = (loc.m[0].0, loc.m[1].0);
+        let lb = [loc.m[0].1 - ws, loc.m[1].1 - ws];
+        let (ipat0, ipat1) = (itb.m[0].0, itb.m[1].0);
+        let ib = std::hint::black_box([(itb.m[0].1 - ws) / 1000, (itb.m[1].1 - ws) / 1000]);
+        let we_r = we - ws;
+        let lim_for = |dim: i64| -> __m256i {
+            let d = dim.clamp(0, 0xFFFF) as i16;
+            _mm256_setr_epi16(d, 23, 59, 59, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
+        };
+        let lims = [lim_for(loc.m[0].2), lim_for(loc.m[1].2)];
+        let vmin = _mm256_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let tplv = a32(*b"-00-00T00:00:00Z");
+        let digv = a32([0, 0, 0, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0]);
+        let pairv = a32([4, 5, 7, 8, 10, 11, 13, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        let mut ls = s;
+        while ls < e {
+            // ---- pass 1: line ends and field contents ----
+            let mut n = 0usize;
+            {
+                let nl = _mm256_set1_epi8(b'\n' as i8);
+                let cm = _mm256_set1_epi8(b',' as i8);
+                let qt = _mm256_set1_epi8(b'"' as i8);
+                let mm = |v: __m256i, t: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, t)) as u32;
+                let tz = |x: u64| x.trailing_zeros() as usize;
+                let bl = |x: u64| x & x.wrapping_sub(1);
+                'p1: while n < B && ls < e {
+                    let lim = e - ls;
+                    let lp = base.add(ls);
+                    *lsv.get_unchecked_mut(n) = (ls - s) as u32;
+                    let y0 = _mm256_loadu_si256(lp as *const __m256i);
+                    let y1 = _mm256_loadu_si256(lp.add(32) as *const __m256i);
+                    let y2 = _mm256_loadu_si256(lp.add(64) as *const __m256i);
+                    let nl01 = _mm256_or_si256(_mm256_cmpeq_epi8(y0, nl), _mm256_cmpeq_epi8(y1, nl));
+                    let nlh = mm(y2, nl);
+                    let l = 64 + nlh.trailing_zeros() as usize; // 96 if none
+                    let d = pos.get_unchecked_mut(n);
+                    n += 1;
+                    'fast: {
+                        if _mm256_testz_si256(nl01, nl01) == 0 || l >= 96 || l >= lim {
+                            break 'fast;
+                        }
+                        let lmh = (1u32 << (l - 64)) - 1;
+                        let c_lo = mm(y0, cm) as u64 | ((mm(y1, cm) as u64) << 32);
+                        let c_hi = (mm(y2, cm) & lmh) as u64;
+                        let q_lo = mm(y0, qt) as u64 | ((mm(y1, qt) as u64) << 32);
+                        let q_hi = (mm(y2, qt) & lmh) as u64;
+                        let r2 = bl(bl(c_lo));
+                        let c3 = r2.trailing_zeros() as usize;
+                        if c_lo.count_ones() + c_hi.count_ones() != 6 || c3 >= 63 || l - c3 > 64 {
+                            break 'fast;
+                        }
+                        let sh = c3 + 1;
+                        let mk = (1u64 << sh) - 1;
+                        let w = (c_lo >> sh) | (c_hi << (64 - sh));
+                        let dl = l - sh;
+                        let qa = q_lo & mk;
+                        let qb = (q_lo >> sh) | (q_hi << (64 - sh));
+                        let ma = c_lo & mk;
+                        let sta = ((ma << 1) | 1) & mk;
+                        let xa = qa & sta;
+                        let ea = ma & !ma.wrapping_sub(xa);
+                        let e1a = ea >> 1;
+                        let mb = w | (1u64 << dl);
+                        let stb = (w << 1) | 1;
+                        let xb = qb & stb;
+                        let eb = mb & !mb.wrapping_sub(xb);
+                        let e1b = eb >> 1;
+                        if ((qa ^ (xa | e1a)) | (xa & e1a) | (qb ^ (xb | e1b)) | (xb & e1b)) != 0 {
+                            break 'fast;
+                        }
+                        let csa = (sta & !xa) | (xa << 1);
+                        let cea = (ma & !ea) | e1a;
+                        let csb = (stb & !xb) | (xb << 1);
+                        let ceb = (mb & !eb) | e1b;
+                        // starts and ends: fields 0..2 in line offsets, 3..6 relative to sh
+                        d[0] = tz(csa) as u8;
+                        d[1] = tz(cea) as u8;
+                        d[2] = tz(bl(csa)) as u8;
+                        d[3] = tz(bl(cea)) as u8;
+                        d[4] = tz(bl(bl(csa))) as u8;
+                        d[5] = tz(bl(bl(cea))) as u8;
+                        let (cs1, ce1) = (bl(csb), bl(ceb));
+                        let (cs2, ce2) = (bl(cs1), bl(ce1));
+                        d[6] = tz(csb) as u8;
+                        d[7] = tz(ceb) as u8;
+                        d[8] = tz(cs1) as u8;
+                        d[9] = tz(ce1) as u8;
+                        d[10] = tz(cs2) as u8;
+                        d[11] = tz(ce2) as u8;
+                        d[12] = tz(bl(cs2)) as u8;
+                        d[13] = tz(bl(ce2)) as u8;
+                        d[14] = l as u8;
+                        d[15] = sh as u8;
+                        ls += l + 1;
+                        continue 'p1;
+                    }
+                    d[15] = SLOW;
+                    // the slow line's end (pass 2 hands the line to ev_slow)
+                    ls = if l < 96 && l < lim && _mm256_testz_si256(nl01, nl01) != 0 {
+                        ls + l + 1
+                    } else {
+                        match memchr(b'\n', &buf[ls..e]) {
+                            Some(j) => ls + j + 1,
+                            None => e,
+                        }
+                    };
+                }
+            }
+            // ---- pass 2: decode and write ----
+            let c0 = _mm256_set1_epi8(b'0' as i8);
+            let c9 = _mm256_set1_epi8(9);
+            let c25 = _mm256_set1_epi8(25);
+            let c49 = _mm256_set1_epi8(49);
+            let c39 = _mm256_set1_epi8(39);
+            let zero = _mm256_setzero_si256();
+            let w36 = _mm256_set1_epi16(0x0124);
+            let w1296 = _mm256_set1_epi32(0x0001_0510);
+            let w10 = _mm256_set1_epi16(0x010A);
+            let tpl = _mm256_load_si256(tplv.0.as_ptr() as *const __m256i);
+            let digsel = _mm256_load_si256(digv.0.as_ptr() as *const __m256i);
+            let pairs = _mm256_load_si256(pairv.0.as_ptr() as *const __m256i);
+            let w2460 = _mm256_setr_epi16(24, 1, 60, 1, 0, 0, 0, 0, 24, 1, 60, 1, 0, 0, 0, 0);
+            'p2: for i in 0..n {
+                let d = *pos.get_unchecked(i);
+                let lsi = s + *lsv.get_unchecked(i) as usize;
+                let lp = base.add(lsi);
+                'fast: {
+                    if d[15] == SLOW {
+                        break 'fast;
+                    }
+                    let (s0, f0, s1, f1, s2, f2) = (d[0] as usize, d[1] as usize, d[2] as usize, d[3] as usize, d[4] as usize, d[5] as usize);
+                    let (s3, f3, s4, f4, s5, f5) = (d[6] as usize, d[7] as usize, d[8] as usize, d[9] as usize, d[10] as usize, d[11] as usize);
+                    let pe = lp.add(s0);
+                    let pu = lp.add(s1);
+                    let pt = lp.add(s2);
+                    let pw = lp.add(d[15] as usize);
+                    let pi = pw.add(s3);
+                    let pk = pw.add(s4);
+                    let ke = (f0 - s0).wrapping_sub(1);
+                    let ku = (f1 - s1).wrapping_sub(1);
+                    let nt = f2 - s2;
+                    let ni = f3 - s3;
+                    let nk = f4 - s4;
+                    let npid = f5 - s5;
+                    let b19 = *pt.add(19);
+                    let is1 = (nt == 20) & (b19 == b'Z');
+                    let is2 = (nt == 25) & ((b19 == b'+') | (b19 == b'-'));
+                    let is3 = nt == 13;
+                    if (ke.wrapping_sub(1) >= 8) | (ku.wrapping_sub(1) >= 8) | (*pe != b'e') | (*pu != b'u') | (ni != 20) | !(is1 | is2 | is3) {
+                        break 'fast;
+                    }
+                    let idx = ke * 9 + ku;
+                    let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(pe.add(1) as *const __m128i)), _mm_loadu_si128(pu.add(1) as *const __m128i));
+                    let dd = _mm256_shuffle_epi8(_mm256_sub_epi8(x, c0), _mm256_load_si256(B36P.0.get_unchecked(idx).0.as_ptr() as *const __m256i));
+                    let dig = _mm256_cmpeq_epi8(_mm256_min_epu8(dd, c9), dd);
+                    let lt = _mm256_sub_epi8(dd, c49);
+                    let let_ = _mm256_cmpeq_epi8(_mm256_min_epu8(lt, c25), lt);
+                    let lead = _mm256_and_si256(_mm256_cmpeq_epi8(dd, zero), _mm256_load_si256(B36P.1.get_unchecked(idx).0.as_ptr() as *const __m256i));
+                    let okid = _mm256_andnot_si256(lead, _mm256_or_si256(dig, let_));
+                    let val = _mm256_sub_epi8(dd, _mm256_and_si256(let_, c39));
+                    let s2v = _mm256_madd_epi16(_mm256_maddubs_epi16(val, w36), w1296);
+                    let qe = _mm_cvtsi128_si64(_mm256_castsi256_si128(s2v)) as u64;
+                    let qu = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(s2v)) as u64;
+                    let xe = (qe & 0xFFFF_FFFF) * 1_679_616 + (qe >> 32);
+                    let xu = (qu & 0xFFFF_FFFF) * 1_679_616 + (qu >> 32);
+                    let v = unscr(xe, ekey);
+                    let un = unscr(xu, ukey);
+                    if _mm256_movemask_epi8(okid) != -1 || (xe | xu) > MASK40 || v >= vb || un >= (1 << 31) {
+                        break 'fast;
+                    }
+                    let yt = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(pt.add(4) as *const __m128i)), _mm_loadu_si128(pi.add(4) as *const __m128i));
+                    let dt = _mm256_sub_epi8(yt, c0);
+                    let okd = _mm256_cmpeq_epi8(_mm256_min_epu8(dt, c9), dt);
+                    let okp = _mm256_cmpeq_epi8(yt, tpl);
+                    let okc = _mm256_movemask_epi8(_mm256_or_si256(_mm256_and_si256(okd, digsel), okp)) as u32;
+                    let mw = _mm256_maddubs_epi16(_mm256_shuffle_epi8(dt, pairs), w10);
+                    let v0t = std::ptr::read_unaligned(pt as *const u64);
+                    let h1 = v0t == lpat1;
+                    let mon_t = (v0t == lpat0) | h1;
+                    let limv = *lims.get_unchecked(h1 as usize);
+                    let rng = _mm256_and_si256(_mm256_cmpeq_epi16(_mm256_min_epu16(mw, limv), mw), _mm256_cmpeq_epi16(_mm256_max_epu16(mw, vmin), mw));
+                    let rok = _mm256_movemask_epi8(rng) == -1;
+                    let sw = _mm256_madd_epi16(mw, w2460);
+                    let qtv = _mm_cvtsi128_si64(_mm256_castsi256_si128(sw)) as u64;
+                    let qiv = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(sw)) as u64;
+                    let v0i = std::ptr::read_unaligned(pi as *const u64);
+                    let g1 = v0i == ipat1;
+                    if (okc & 0xFFF0_0000) != 0xFFF0_0000 || !((v0i == ipat0) | g1) {
+                        break 'fast;
+                    }
+                    let ingest_s = ib[g1 as usize] + ((qiv & 0xFFFF_FFFF) as i64 * 3600 + (qiv >> 32) as i64 - 86_400);
+                    let mut t12 = lb[h1 as usize] + ((qtv & 0xFFFF_FFFF) as i64 * 3600 + (qtv >> 32) as i64 - 86_400) * 1000;
+                    let mut ok12 = mon_t & rok & ((okc & 0x7FF0) == 0x7FF0);
+                    if is2 {
+                        let o = std::ptr::read_unaligned(pt.add(17) as *const u64);
+                        let od = o.wrapping_sub(0x3030_0030_3000_0000);
+                        let digs = od & 0xFFFF_00FF_FF00_0000;
+                        let bad = ((digs.wrapping_add(0x7676_0076_7600_0000) | digs) & 0x8080_0080_8000_0000) | (((o >> 40) & 0xFF) ^ 0x3A);
+                        let oh = ((od >> 24) & 0xFF) * 10 + ((od >> 32) & 0xFF);
+                        let om = ((od >> 48) & 0xFF) * 10 + ((od >> 56) & 0xFF);
+                        ok12 &= (bad == 0) & (oh <= 23) & (om <= 59);
+                        let off = (oh * 60 + om) as i64 * 60_000;
+                        t12 = if b19 == b'+' { t12 - off } else { t12 + off };
+                    }
+                    let (v3, ok3) = d13_bl(pt);
+                    let m3 = (is3 as i64).wrapping_neg();
+                    let tr = ((v3 - ws) & m3) | (t12 & !m3);
+                    let okt = (ok3 & is3) | (ok12 & !is3);
+                    let wk = std::ptr::read_unaligned(pk as *const u32);
+                    let w8 = std::ptr::read_unaligned(pk as *const u64);
+                    let is_view = (nk == 4) & (wk == u32::from_le_bytes(*b"view"));
+                    let is_cart = (nk == 4) & (wk == u32::from_le_bytes(*b"cart"));
+                    let is_pur = (nk == 8) & (w8 == u64::from_le_bytes(*b"purchase"));
+                    let mut valid = okt & (tr >= 0) & (tr < we_r) & (ingest_s * 1000 - tr <= DAY) & (is_view | is_cart | is_pur) & (npid > 0);
+                    let ty = (is_cart as u32) | ((is_pur as u32) << 1);
+                    let p = (v >> psh) as usize;
+                    let vl = (v as u32) & vmask;
+                    let (mut pr, mut cat) = (0u32, 0u32);
+                    if valid & is_pur {
+                        let (s6, f6) = (d[12] as usize, d[13] as usize);
+                        match parse_price(std::slice::from_raw_parts(pw.add(s6), f6 - s6)) {
+                            Some(x) => {
+                                pr = x;
+                                cat = cx.products.get_fast(std::slice::from_raw_parts(pw.add(s5), npid)).unwrap_or(cx.unknown_cat) as u32;
+                            }
+                            None => valid = false,
+                        }
+                    }
+                    let typ = if valid { ty } else { 3 };
+                    wc.push(p, DRec { meta: vl | (typ << 22), uid: if valid { un as u32 } else { 0 }, ts: if valid { tr as u32 } else { 0 }, ingest: ingest_s as i32 });
+                    if typ == 2 {
+                        purs.get_unchecked_mut(p).push(PRec { v_low: vl, price: pr, cat });
+                    }
+                    *maxp = (*maxp).max(p);
+                    continue 'p2;
+                }
+                nslow += 1;
+                ev_slow::<K>(buf, lsi, e, cx, wc, purs, sparse, maxp);
+            }
+        }
+    }
+    nslow
+}
+
 /// Parses event lines b[s..e) into the partition write-combiner. V selects code variants.
 #[inline(never)]
 fn parse_ev<const V: u32, const K: usize>(b: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) {
@@ -2889,7 +3150,9 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         while (vb >> s) > *K_PARTS as u64 {
             s += 1;
         }
-        s
+        // SESS_PSH: a fixed partition span (2^psh event indexes) when it keeps the count in range
+        let want = knob("SESS_PSH", 0) as u32;
+        if want >= 10 && (vb >> want) <= 8192 { want } else { s }
     };
     if psh > 22 {
         return Err("too big".into());
@@ -2996,6 +3259,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                         let var = *K_VAR;
                         if var & 96 != 0 {
                             let n = match (var & 64 != 0, var & 8 != 0) {
+                                (true, true) if var & 512 != 0 => parse_ev5::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (true, true) => parse_ev4::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (true, false) => parse_ev4::<4>(b, s, e, evcx, &mut st.wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (false, true) => parse_ev3::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
@@ -3277,6 +3541,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let seg_lo = |s: usize| bounds[s];
     struct SB {
         slot: Vec<u32>,
+        dense: Vec<DRec>,
         pbuf: Vec<PRec>,
         cur: Vec<UEv>,
         blk: Vec<UEv>,
@@ -3298,7 +3563,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let sb = run(
         nt,
         nseg,
-        |_| SB { slot: vec![0u32; 1 << psh], pbuf: vec![], cur: vec![], blk: vec![], bnd: vec![], us: new_us(), out: new_out(), pieces: vec![], meta: vec![], bad: false },
+        |_| SB { slot: vec![], dense: vec![DRec { meta: 0, uid: 0, ts: 0, ingest: i32::MAX }; 1 << psh], pbuf: vec![], cur: vec![], blk: vec![], bnd: vec![], us: new_us(), out: new_out(), pieces: vec![], meta: vec![], bad: false },
         |st, s| {
             if st.bad {
                 return;
@@ -3310,19 +3575,15 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             st.cur.clear();
             for p in p0..p1 {
                 let parts: Vec<&[DRec]> = sa_r.iter().map(|x| &x.ev[p][..]).collect();
-                let slot = &mut st.slot;
-                for (ti, sl) in parts.iter().enumerate() {
-                    for (i, r) in sl.iter().enumerate() {
-                        let vl = (r.meta & vmask) as usize;
-                        let code = ((ti as u32) << 26) | (i as u32 + 1);
-                        let sv = unsafe { *slot.get_unchecked(vl) };
-                        if sv == 0 {
-                            unsafe { *slot.get_unchecked_mut(vl) = code };
-                        } else {
-                            let o = &parts[(sv >> 26) as usize][((sv & ((1 << 26) - 1)) - 1) as usize];
-                            if r.ingest < o.ingest {
-                                unsafe { *slot.get_unchecked_mut(vl) = code };
-                            }
+                // dedup by direct placement: dense[v_low] keeps the copy with the smallest ingest
+                // (an empty slot has ingest i32::MAX; a copy with that ingest is invalid and can
+                // only lose, so dropping it changes nothing)
+                let dn = st.dense.as_mut_ptr();
+                for sl in parts.iter() {
+                    for r in sl.iter() {
+                        let d = unsafe { &mut *dn.add((r.meta & vmask) as usize) };
+                        if r.ingest < d.ingest {
+                            *d = *r;
                         }
                     }
                 }
@@ -3342,20 +3603,15 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 unsafe {
                     let w0 = st.cur.as_mut_ptr();
                     let mut w = w0.add(st.cur.len());
-                    let slotp = st.slot.as_mut_ptr();
                     let pb = st.pbuf.as_ptr();
                     let mut pc = 0usize;
-                    let mut bases = [std::ptr::null::<DRec>(); 64];
-                    for (ti, sl) in parts.iter().enumerate() {
-                        bases[ti] = sl.as_ptr();
-                    }
                     for vl in 0..span {
-                        let sv = *slotp.add(vl);
-                        if sv == 0 {
+                        let d = &mut *dn.add(vl);
+                        if d.ingest == i32::MAX {
                             continue;
                         }
-                        *slotp.add(vl) = 0;
-                        let r = *bases.get_unchecked((sv >> 26) as usize).add(((sv & ((1 << 26) - 1)) - 1) as usize);
+                        d.ingest = i32::MAX;
+                        let r = *d;
                         let typ = (r.meta >> 22) & 3;
                         if typ == 3 {
                             continue;
@@ -3366,6 +3622,13 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                                 pc += 1;
                             }
                             let pr = *pb.add(pc);
+                            // purchase copies of one event that disagree on price or category:
+                            // which one is kept is not recorded here, so leave it to the general path
+                            let nx = *pb.add(pc + 1);
+                            if nx.v_low == vl as u32 && (nx.price != pr.price || nx.cat != pr.cat) {
+                                st.bad = true;
+                                return;
+                            }
                             e.price = pr.price;
                             e.tc |= pr.cat << 2;
                         }
@@ -4099,10 +4362,12 @@ pub(crate) fn fuzz_ev(iters: usize) {
         let (mut sa, mut sb): (Vec<SRec>, Vec<SRec>) = (vec![], vec![]);
         let (mut ma, mut mb) = (0usize, 0usize);
         parse_ev::<0, 4>(&buf, 0, e, &cx, &mut wa, &mut pa, &mut sa, &mut ma);
-        if it % 2 == 0 {
+        if it % 3 == 0 {
             total_slow += parse_ev3::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
-        } else {
+        } else if it % 3 == 1 {
             total_slow += parse_ev4::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
+        } else {
+            total_slow += parse_ev5::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
         }
         let (oa, ob) = (wa.finish(), wb.finish());
         let dk = |r: &DRec| (r.meta, r.uid, r.ts, r.ingest);
@@ -4128,10 +4393,12 @@ pub(crate) fn fuzz_ev(iters: usize) {
                     let (mut s1, mut s2): (Vec<SRec>, Vec<SRec>) = (vec![], vec![]);
                     let (mut m1, mut m2) = (0usize, 0usize);
                     parse_ev::<0, 4>(&one, 0, ee, &cx, &mut w1, &mut p1, &mut s1, &mut m1);
-                    if it % 2 == 0 {
+                    if it % 3 == 0 {
                         parse_ev3::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
-                    } else {
+                    } else if it % 3 == 1 {
                         parse_ev4::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
+                    } else {
+                        parse_ev5::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
                     }
                     let (o1, o2) = (w1.finish(), w2.finish());
                     let r1: Vec<_> = o1.iter().flatten().map(dk).collect();
