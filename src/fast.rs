@@ -7,6 +7,86 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+mod legacy_intern {
+    use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    struct Interner {
+        map: FxHashMap<Vec<u8>, u64>,
+        strs: Vec<Vec<u8>>,
+    }
+    static INTERN: LazyLock<Mutex<Interner>> =
+        LazyLock::new(|| Mutex::new(Interner { map: FxHashMap::default(), strs: vec![] }));
+
+    #[inline(always)]
+    pub(super) fn key(s: &[u8]) -> u64 {
+        let n = s.len();
+        if n <= 9 {
+            let mut b = [0u8; 9];
+            b[..n].copy_from_slice(s);
+            let x = u64::from_le_bytes(b[..8].try_into().unwrap());
+            if let Some(k) = pack(x, b[8], n) {
+                return k;
+            }
+        }
+        intern(s)
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn key_fast(s: &[u8]) -> u64 {
+        let n = s.len();
+        if n <= 9 {
+            let p = s.as_ptr();
+            let raw = unsafe { std::ptr::read_unaligned(p as *const u64) };
+            let lm = if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
+            let c9 = if n == 9 { unsafe { *p.add(8) } } else { 0 };
+            if let Some(k) = pack(raw & lm, c9, n) {
+                return k;
+            }
+        }
+        intern(s)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn intern(s: &[u8]) -> u64 {
+        let mut g = INTERN.lock().unwrap();
+        if let Some(&k) = g.map.get(s) {
+            return k;
+        }
+        let k = FALLBACK | g.strs.len() as u64;
+        g.strs.push(s.to_vec());
+        g.map.insert(s.to_vec(), k);
+        k
+    }
+
+    pub(super) fn key_bytes(k: u64) -> Vec<u8> {
+        if k & FALLBACK != 0 {
+            INTERN.lock().unwrap().strs[(k & !FALLBACK) as usize].clone()
+        } else {
+            let mut out = Vec::with_capacity(9);
+            for i in 0..9 {
+                let c = ((k >> (7 * (8 - i))) & 0x7F) as u8;
+                if c == 0 {
+                    break;
+                }
+                out.push(c);
+            }
+            out
+        }
+    }
+
+    #[inline]
+    pub(super) fn cmp_key(a: u64, b: u64) -> Ordering {
+        if (a | b) & FALLBACK == 0 {
+            a.cmp(&b)
+        } else {
+            key_bytes(a).cmp(&key_bytes(b))
+        }
+    }
+}
+use legacy_intern::{cmp_key, key, key_bytes, key_fast};
+
 static NSLOW: AtomicU64 = AtomicU64::new(0);
 static NSLOWC: AtomicU64 = AtomicU64::new(0);
 /// software prefetch distance in the line parsers (bytes ahead of the current line)
@@ -184,12 +264,12 @@ unsafe fn raw_idv(p: *const u8, n: usize, prefix: u8, tab: &[(A16, A16)]) -> Opt
 
 /// Months that an F1 timestamp may fall in: ("YYYY-MM-" as LE u64, first ms of month, days in month)
 pub(crate) struct MonTab {
-    m: [(u64, i64, i64); 4],
+    pub(crate) m: [(u64, i64, i64); 4],
     n: usize,
-    complete: bool,
+    pub(crate) complete: bool,
 }
 impl MonTab {
-    fn new(from: i64, to: i64) -> MonTab {
+    pub(crate) fn new(from: i64, to: i64) -> MonTab {
         // every month intersecting [from, to]
         let mut t = MonTab { m: [(u64::MAX, 0, 0); 4], n: 0, complete: false };
         let civil = |ms: i64| -> (i64, i64) {
@@ -232,7 +312,7 @@ impl MonTab {
 
 /// F1 "YYYY-MM-DDTHH:MM:SSZ" (20 bytes at p) whose month is in the table; None otherwise.
 #[inline(always)]
-unsafe fn f1_tab(p: *const u8, t: &MonTab) -> Option<i64> {
+pub(crate) unsafe fn f1_tab(p: *const u8, t: &MonTab) -> Option<i64> {
     unsafe {
         let v0 = std::ptr::read_unaligned(p as *const u64);
         // at most two months per table (checked at construction)
@@ -269,7 +349,7 @@ unsafe fn f1_tab(p: *const u8, t: &MonTab) -> Option<i64> {
 
 /// F2 "YYYY-MM-DDTHH:MM:SS+HH:MM" (25 bytes at p) whose local month is in the table; None otherwise.
 #[inline(always)]
-unsafe fn f2_tab(p: *const u8, t: &MonTab) -> Option<i64> {
+pub(crate) unsafe fn f2_tab(p: *const u8, t: &MonTab) -> Option<i64> {
     unsafe {
         let v0 = std::ptr::read_unaligned(p as *const u64);
         let (base, dim) = if v0 == t.m[0].0 {
@@ -382,7 +462,7 @@ unsafe fn ts_win_v<const V: u32>(b: &[u8], win: &MonTab, loc: &MonTab) -> Option
 /// ingest_ts is always valid F1 (rules.md): seconds since `ws` for a table month, decoded without
 /// validation like the general path; None for anything else (the caller falls back).
 #[inline(always)]
-unsafe fn ingest_tab(p: *const u8, t: &MonTab, ws: i64) -> Option<i64> {
+pub(crate) unsafe fn ingest_tab(p: *const u8, t: &MonTab, ws: i64) -> Option<i64> {
     unsafe {
         let v0 = std::ptr::read_unaligned(p as *const u64);
         let base = if v0 == t.m[0].0 {
@@ -405,7 +485,7 @@ unsafe fn ingest_tab(p: *const u8, t: &MonTab, ws: i64) -> Option<i64> {
 
 /// 13 ASCII digits at p (16 readable bytes) -> value
 #[inline(always)]
-unsafe fn digits13(p: *const u8) -> Option<i64> {
+pub(crate) unsafe fn digits13(p: *const u8) -> Option<i64> {
     unsafe {
         let raw = _mm_loadu_si128(p as *const __m128i);
         // right-align 13 digits into 16 lanes: lanes 0..3 = '0'
@@ -4299,11 +4379,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             let cat_names = &cat_names;
             let gg = g;
             scope.spawn(move || {
-                if std::env::var_os("SESS_OLDPQ").is_some() {
-                    write_user(&ud.join(format!("part-{gg:03}.parquet")), &o.rows, cat_names)
-                } else {
-                    write_user_pq(&ud.join(format!("part-{gg:03}.parquet")), &o.rows, cat_names).unwrap()
-                }
+                write_user_pq(&ud.join(format!("part-{gg:03}.parquet")), &o.rows, cat_names).unwrap()
             });
             g += 1;
         }
@@ -4322,11 +4398,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                 }
             }
         }
-        if std::env::var_os("SESS_OLDPQ").is_some() {
-            write_camp(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v);
-        } else {
-            write_camp_pq(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v).unwrap();
-        }
+        write_camp_pq(&cd.join("part-000.parquet"), &c_id, &c_ch, &c_day, &c_v).unwrap();
     });
     log("done");
     Ok(())
@@ -4578,7 +4650,7 @@ fn write_user_pq(path: &Path, rows: &[UserRow], cat_names: &[Vec<u8>]) -> std::i
     crate::pq::write(path, n, &[uid, day, ses, evc, rev, top])
 }
 
-fn write_camp_pq(path: &Path, ids: &[Vec<u8>], ch: &[Vec<u8>], day: &[i32], v: &[[i64; 4]]) -> std::io::Result<()> {
+pub(crate) fn write_camp_pq(path: &Path, ids: &[Vec<u8>], ch: &[Vec<u8>], day: &[i32], v: &[[i64; 4]]) -> std::io::Result<()> {
     use crate::pq::{Col, Kind as K};
     let n = ids.len();
     let mut c0 = Col::new("campaign_id", K::Str, n * 12);

@@ -19,6 +19,8 @@ RUN set -e; \
     ( rustup component add llvm-tools \
       && RUSTFLAGS="$BASEFLAGS -Cprofile-generate=/tmp/pgo" cargo build --release --locked --target-dir /tmp/inst \
       && generate --seed 5 --events 2000000 --clicks 500000 --output /tmp/train \
+      && MUTATE_HEX=/tmp/train /tmp/inst/release/sess \
+      && rm -f /tmp/pgo/*.profraw \
       && mkdir -p /tmp/out \
       && DATA_DIR=/tmp/train OUTPUT_DIR=/tmp/out NCPU=4 /tmp/inst/release/sess \
       && PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -1) \
