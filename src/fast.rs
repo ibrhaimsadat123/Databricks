@@ -1190,24 +1190,31 @@ fn sess_two(name: u64, ev: &[UEv], cl: &[C16], cx: &SessCx, sc: &mut SessSc, use
             let mut last = st;
             let mut rev = 0i64;
             let mut pur = 0u8;
-            while k < n {
-                let e = *p.add(k);
-                if e.ts.wrapping_sub(last) > GAP as u32 {
+            // one pointer walk; types are 0..=2 here (dropped events never reach a block), so
+            // bit 1 of tc marks a purchase
+            let mut q = p.add(k);
+            let end = p.add(n);
+            while q < end {
+                let ts = (*q).ts;
+                if ts.wrapping_sub(last) > GAP as u32 {
                     break;
                 }
-                last = e.ts;
-                if e.tc & 3 == 2 {
-                    let cat = (e.tc >> 2) as usize;
+                last = ts;
+                let tc = (*q).tc;
+                if tc & 2 != 0 {
+                    let cat = (tc >> 2) as usize;
+                    let price = (*q).price as i64;
                     pur = 1;
-                    rev += e.price as i64;
+                    rev += price;
                     let cs = &mut *catsum.add(cat);
                     if *cs == 0 {
                         sc.touched.push(cat as u16);
                     }
-                    *cs += e.price as i64;
+                    *cs += price;
                 }
-                k += 1;
+                q = q.add(1);
             }
+            k = q.offset_from(p) as usize;
             *ss.add(ns) = st;
             *sd.add(ns) = day;
             *sr.add(ns) = rev;
