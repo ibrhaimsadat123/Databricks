@@ -1651,6 +1651,7 @@ fn main() {
         }
     }
     if std::env::var("FUZZ").is_ok() { fuzz(); return; }
+    if let Ok(n) = std::env::var("FUZZEV") { fast::fuzz_ev(n.parse().unwrap_or(1000)); return; }
     if std::env::var("FAST_FUZZ").is_ok() { fast::fuzz_fast(); return; }
     if let Ok(d) = std::env::var("PQ_TEST") { fast::pq_empty_test(Path::new(&d)); return; }
     if let Ok(w) = std::env::var("FAST_BENCH") {
