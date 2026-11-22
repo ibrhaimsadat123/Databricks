@@ -901,7 +901,13 @@ fn for_rows_fast_v<const N: usize, const V: u32>(buf: &[u8], s: usize, e: usize,
                 for k in 0..N {
                     a[k] = &buf[f[k].0..f[k].1];
                 }
-                g(a);
+                if V & 128 != 0 {
+                    let gd: &mut dyn FnMut([&[u8]; N]) = &mut g;
+                    std::hint::black_box(&gd);
+                    gd(a);
+                } else {
+                    g(a);
+                }
             }
             ls = ni;
             continue;
@@ -954,7 +960,49 @@ fn for_rows_fast_v<const N: usize, const V: u32>(buf: &[u8], s: usize, e: usize,
             let lp = unsafe { base.add(ls) };
             let mut a: [&[u8]; N] = [&[]; N];
             let nq = mq[0].count_ones() + mq[1].count_ones();
-            if V & 2 == 0 && nq == 0 {
+            if V & 128 != 0 {
+                // one call site for the row callback: compute the quote flags, then the slices
+                let (fsb, ok): (u64, bool) = if nq == 0 {
+                    (0, true)
+                } else if le_off < 127 {
+                    let sm = [(mc[0] << 1) | 1, (mc[1] << 1) | (mc[0] >> 63)];
+                    let em = {
+                        let mut x = [mc[0], mc[1]];
+                        x[le_off >> 6] |= 1u64 << (le_off & 63);
+                        x
+                    };
+                    let last = [(em[0] >> 1) | (em[1] << 63), em[1] >> 1];
+                    let qs = [mq[0] & sm[0], mq[1] & sm[1]];
+                    let ql = [mq[0] & last[0], mq[1] & last[1]];
+                    let qe = [(mq[0] << 1) & em[0], ((mq[1] << 1) | (mq[0] >> 63)) & em[1]];
+                    let fsb = pext64(qs[0], sm[0]) | (pext64(qs[1], sm[1]) << sm[0].count_ones());
+                    let feb = pext64(qe[0], em[0]) | (pext64(qe[1], em[1]) << em[0].count_ones());
+                    (fsb, (qs[0] | ql[0]) == mq[0] && (qs[1] | ql[1]) == mq[1] && fsb == feb && nq == 2 * fsb.count_ones())
+                } else {
+                    let mut fs = 0usize;
+                    let mut bits = 0u64;
+                    for k in 0..N {
+                        let fe = ends[k];
+                        let len = fe - fs;
+                        let last = if len > 0 { fe - 1 } else { fs };
+                        let qa = unsafe { *lp.add(fs) } == b'"';
+                        let qb = unsafe { *lp.add(last) } == b'"';
+                        bits |= ((qa & qb & (len >= 2)) as u64) << k;
+                        fs = fe + 1;
+                    }
+                    (bits, nq == 2 * bits.count_ones())
+                };
+                if ok {
+                    let mut fs = 0usize;
+                    for k in 0..N {
+                        let fe = ends[k];
+                        let q = ((fsb >> k) & 1) as usize;
+                        a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + q), fe - fs - 2 * q) };
+                        fs = fe + 1;
+                    }
+                    g(a);
+                }
+            } else if V & 2 == 0 && nq == 0 {
                 let mut fs = 0usize;
                 for k in 0..N {
                     let fe = ends[k];
@@ -1558,12 +1606,14 @@ fn fuzz_rows() {
         let mut buf = chunk.clone();
         for _ in 0..128 { buf.push((next() & 0xff) as u8); }
         let mut fast: Vec<Vec<Vec<u8>>> = vec![];
-        match it % 5 {
+        match it % 6 {
             0 => for_rows_fast_v::<7, 0>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
             1 => for_rows_fast_v::<7, 1>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
             2 => for_rows_fast_v::<7, 2>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
             3 => for_rows_fast_v::<7, 3>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
-            _ => for_rows_fast2::<7>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+            4 if it % 2 == 0 => for_rows_fast_v::<7, 128>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+            4 => for_rows_fast_v::<7, 129>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
+            _ => for_rows_fast_v::<7, 128>(&buf, 0, e, |a| fast.push(a.iter().map(|x| x.to_vec()).collect())),
         }
         let mut slow: Vec<Vec<Vec<u8>>> = vec![];
         let mut f = [(0usize, 0usize); 7];

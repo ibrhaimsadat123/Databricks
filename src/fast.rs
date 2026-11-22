@@ -1285,12 +1285,200 @@ struct EvCtx<'a> {
     unknown_cat: u16,
 }
 
+/// One event row (fields already unquoted) into the partition write-combiner.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn ev_row<const V: u32, const K: usize>(f: [&[u8]; 7], cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) {
+    let [eid, uid, ts, ing, et, pid, price] = f;
+    let (ws, we, ukey, ekey, vb, psh, vmask) = (cx.ws, cx.we, cx.ukey, cx.ekey, cx.vb, cx.psh, cx.vmask);
+    if eid.is_empty() {
+        return;
+    }
+    let ingest_s = unsafe { ingest_win(ing, cx.ingtab, ws) };
+    let ingest = ingest_s as i32;
+    let mut typ = 3u32;
+    let mut tsr = 0u32;
+    let mut pr = 0u32;
+    let mut cat = 0u32;
+    'v: {
+        if uid.is_empty() || pid.is_empty() {
+            break 'v;
+        }
+        let Some(t) = (unsafe { ts_win_v::<V>(ts, cx.evwin, cx.evloc) }) else { break 'v };
+        if t < ws || t >= we || ingest_s == i32::MAX as i64 || (ingest_s * 1000 + ws) - t > DAY {
+            break 'v;
+        }
+        let ty = match et.len() {
+            4 => {
+                let w = u32::from_le_bytes(et.try_into().unwrap());
+                let is_cart = w == u32::from_le_bytes(*b"cart");
+                if !(is_cart | (w == u32::from_le_bytes(*b"view"))) {
+                    break 'v;
+                }
+                is_cart as u32
+            }
+            8 => {
+                if u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+                    2
+                } else {
+                    break 'v;
+                }
+            }
+            _ => break 'v,
+        };
+        if ty == 2 {
+            match parse_price(price) {
+                Some(p) => pr = p,
+                None => break 'v,
+            }
+            cat = (unsafe { cx.products.get_fast(pid) }).unwrap_or(cx.unknown_cat) as u32;
+        }
+        tsr = (t - ws) as u32;
+        typ = ty;
+    }
+    let u = if typ != 3 { unsafe { dec_uid(uid, ukey) } } else { 0 };
+    let v = match unsafe { raw_idv(eid.as_ptr(), eid.len(), b'e', &B36T) } {
+        Some(x) => unscr(x, ekey),
+        None => u64::MAX,
+    };
+    if v < vb {
+        let p = (v >> psh) as usize;
+        let vl = (v as u32) & vmask;
+        wc.push(p, DRec { meta: vl | (typ << 22), uid: u, ts: tsr, ingest });
+        if typ == 2 {
+            unsafe { purs.get_unchecked_mut(p) }.push(PRec { v_low: vl, price: pr, cat });
+        }
+        *maxp = (*maxp).max(p);
+    } else {
+        let k = unsafe { key_fast(eid) };
+        sparse.push(SRec { eid: k, rec: DRec { meta: typ << 22, uid: u, ts: tsr, ingest }, price: pr, cat });
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn ev_row_cold<const K: usize>(f: [&[u8]; 7], cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) {
+    ev_row::<0, K>(f, cx, wc, purs, sparse, maxp)
+}
+
+/// Hand-flattened event line parser: one inlined row handler, branchless comma extraction,
+/// quote flags computed once per line (same results as parse_ev).
+#[inline(never)]
+fn parse_ev2<const V: u32, const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) {
+    assert!(buf.len() >= e + 128);
+    let base = buf.as_ptr();
+    let mut ls = s;
+    let mut fl = [(0usize, 0usize); 7];
+    while ls < e {
+        let lim = e - ls;
+        let lp = unsafe { base.add(ls) };
+        let (mc, mut mn, mq) = masks128(unsafe { buf.get_unchecked(ls..ls + 128) });
+        if lim < 128 {
+            mn[0] &= low_mask(lim);
+            mn[1] &= if lim > 64 { low_mask(lim - 64) } else { 0 };
+        }
+        let le_off = if mn[0] != 0 {
+            mn[0].trailing_zeros() as usize
+        } else if mn[1] != 0 {
+            64 + mn[1].trailing_zeros() as usize
+        } else if lim <= 128 {
+            lim
+        } else {
+            let (ni, ok) = next_line::<7>(&buf[..e], ls, &mut fl);
+            if ok {
+                let mut a: [&[u8]; 7] = [&[]; 7];
+                for k in 0..7 {
+                    a[k] = &buf[fl[k].0..fl[k].1];
+                }
+                ev_row_cold::<K>(a, cx, wc, purs, sparse, maxp);
+            }
+            ls = ni;
+            continue;
+        };
+        let m0 = low_mask(le_off);
+        let m1 = if le_off > 64 { low_mask(le_off - 64) } else { 0 };
+        let (c0, c1) = (mc[0] & m0, mc[1] & m1);
+        let next = ls + le_off + 1;
+        if c0.count_ones() + c1.count_ones() != 6 {
+            ls = next;
+            continue;
+        }
+        // comma offsets, branchless
+        let mut ends = [0usize; 7];
+        {
+            let (mut w0, mut w1) = (c0, c1);
+            for k in 0..6 {
+                let p0 = w0.trailing_zeros() as usize;
+                let p1 = 64 + w1.trailing_zeros() as usize;
+                let use0 = w0 != 0;
+                ends[k] = if use0 { p0 } else { p1 };
+                let b0 = w0 & w0.wrapping_sub(1);
+                let b1 = w1 & w1.wrapping_sub(1);
+                w0 = if use0 { b0 } else { w0 };
+                w1 = if use0 { w1 } else { b1 };
+            }
+        }
+        ends[6] = le_off;
+        let (q0, q1) = (mq[0] & m0, mq[1] & m1);
+        let nq = q0.count_ones() + q1.count_ones();
+        let fsb: u64 = if nq == 0 {
+            0
+        } else if le_off < 127 {
+            let sm = [(c0 << 1) | 1, (c1 << 1) | (c0 >> 63)];
+            let mut em = [c0, c1];
+            em[le_off >> 6] |= 1u64 << (le_off & 63);
+            let last = [(em[0] >> 1) | (em[1] << 63), em[1] >> 1];
+            let qs = [q0 & sm[0], q1 & sm[1]];
+            let ql = [q0 & last[0], q1 & last[1]];
+            let qe = [(q0 << 1) & em[0], ((q1 << 1) | (q0 >> 63)) & em[1]];
+            let fsb = pext64(qs[0], sm[0]) | (pext64(qs[1], sm[1]) << sm[0].count_ones());
+            let feb = pext64(qe[0], em[0]) | (pext64(qe[1], em[1]) << em[0].count_ones());
+            if !((qs[0] | ql[0]) == q0 && (qs[1] | ql[1]) == q1 && fsb == feb && nq == 2 * fsb.count_ones()) {
+                ls = next;
+                continue;
+            }
+            fsb
+        } else {
+            let mut fs = 0usize;
+            let mut bits = 0u64;
+            for k in 0..7 {
+                let fe = ends[k];
+                let len = fe - fs;
+                let lst = if len > 0 { fe - 1 } else { fs };
+                let qa = unsafe { *lp.add(fs) } == b'"';
+                let qb = unsafe { *lp.add(lst) } == b'"';
+                bits |= ((qa & qb & (len >= 2)) as u64) << k;
+                fs = fe + 1;
+            }
+            if nq != 2 * bits.count_ones() {
+                ls = next;
+                continue;
+            }
+            bits
+        };
+        let mut a: [&[u8]; 7] = [&[]; 7];
+        let mut fs = 0usize;
+        for k in 0..7 {
+            let fe = ends[k];
+            let q = ((fsb >> k) & 1) as usize;
+            a[k] = unsafe { std::slice::from_raw_parts(lp.add(fs + q), fe - fs - 2 * q) };
+            fs = fe + 1;
+        }
+        ev_row::<V, K>(a, cx, wc, purs, sparse, maxp);
+        ls = next;
+    }
+}
+
 /// Parses event lines b[s..e) into the partition write-combiner. V selects code variants.
 #[inline(never)]
 fn parse_ev<const V: u32, const K: usize>(b: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) {
     let (ws, we, ukey, ekey, vb, psh, vmask) = (cx.ws, cx.we, cx.ukey, cx.ekey, cx.vb, cx.psh, cx.vmask);
     let (evwin, evloc, ingtab, products, unknown_cat) = (cx.evwin, cx.evloc, cx.ingtab, cx.products, cx.unknown_cat);
     for_rows_fast_v::<7, V>(b, s, e, #[inline(always)] |[eid, uid, ts, ing, et, pid, price]| {
+        if V & 256 != 0 {
+            std::hint::black_box(eid.len() + uid.len() + ts.len() + ing.len() + et.len() + pid.len() + price.len() + eid.as_ptr() as usize);
+            return;
+        }
         if eid.is_empty() {
             return;
         }
@@ -1717,6 +1905,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                                 1 => parse_ev::<1, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 3 => parse_ev::<3, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 5 => parse_ev::<5, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                7 => parse_ev2::<0, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 _ => parse_ev::<7, 8>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                             }
                         } else {
@@ -1724,6 +1913,10 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                             match var & 23 {
                                 16 => parse_ev::<16, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 18 => parse_ev::<64, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                20 => parse_ev::<128, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                22 => parse_ev::<256, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                23 => parse_ev2::<0, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                21 => parse_ev::<129, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 17 => parse_ev::<17, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 0 => parse_ev::<0, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 1 => parse_ev::<1, 4>(b, s, e, evcx, wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
@@ -2128,65 +2321,78 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     let mut outs: Vec<Out> = sb.into_iter().map(|s| s.out).collect();
     outs.extend(fix.into_iter().map(|s| s.1));
     outs.push(left_out);
-    let mut side: Vec<(u64, UEv)> = side_pre;
+    // all side events and clicks, bucketed by person hash; every bucket sorts and runs its own
+    // persons, so nothing here is serial
+    let mut ev_srcs: Vec<Vec<(u64, UEv)>> = vec![side_pre];
     for o in outs.iter_mut() {
-        side.append(&mut o.side);
+        ev_srcs.push(std::mem::take(&mut o.side));
     }
-    let mut sck: Vec<(u64, C16)> = ckside.into_iter().flatten().collect();
-    for s in sa.iter() {
-        for c in &s.spck {
-            sck.push((pers.of(c.uid).0, *c));
-        }
-    }
+    let ck_srcs: Vec<Vec<(u64, C16)>> = ckside;
+    let spck: Vec<Vec<C16>> = sa.iter().map(|x| x.spck.clone()).collect();
     drop(sa);
-    side.sort_unstable_by_key(|x| (x.0, x.1.ts));
-    sck.sort_unstable_by_key(|x| (x.0, x.1.ts));
-    let mut sgroups: Vec<(usize, usize)> = vec![];
-    {
-        let mut i = 0;
-        while i < side.len() {
-            let mut j = i + 1;
-            while j < side.len() && side[j].0 == side[i].0 {
-                j += 1;
-            }
-            sgroups.push((i, j));
-            i = j;
-        }
-    }
-    sgroups.sort_unstable_by_key(|g| std::cmp::Reverse(g.1 - g.0));
-    let side_r = &side;
-    let sck_r = &sck;
-    let sgroups_r = &sgroups;
+    let nsb = 64usize;
+    let hb = |p: u64| (mix(p) >> 58) as usize;
+    let ev_srcs_r = &ev_srcs;
+    let ck_srcs_r = &ck_srcs;
+    let spck_r = &spck;
     let (sout, _) = run_map(
         nt,
-        sgroups.len(),
-        |_| (new_us(), new_out(), Vec::<UEv>::new(), Vec::<C16>::new()),
-        |st, g| {
-            let (i, j) = sgroups_r[g];
-            let p = side_r[i].0;
-            st.2.clear();
-            st.2.extend(side_r[i..j].iter().map(|x| x.1));
-            st.2.sort_by_key(|e| e.ts);
-            let a = sck_r.partition_point(|x| x.0 < p);
-            let b = sck_r.partition_point(|x| x.0 <= p);
-            st.3.clear();
-            if p & (CLASS_TAG | SPEC_TAG) == 0 || (p & CLASS_TAG != 0 && pers.cuser[(p & !CLASS_TAG) as usize] != NOUSER) {
-                // simple person routed here (pathological grouping): clicks live with its user
-                let u = if p & CLASS_TAG != 0 { pers.cuser[(p & !CLASS_TAG) as usize] } else { (p as u32) >> 9 };
-                let q = (u >> CSH) as usize;
-                let lu = (u & ((1 << CSH) - 1)) as usize;
-                if q < cq.len() && !cq[q].ofs.is_empty() {
-                    for c in &cq[q].cks[cq[q].ofs[lu] as usize..cq[q].ofs[lu + 1] as usize] {
-                        if pers.of(c.uid).0 == p {
-                            st.3.push(*c);
-                        }
+        nsb,
+        |_| (new_us(), new_out(), Vec::<(u64, UEv)>::new(), Vec::<(u64, C16)>::new(), Vec::<UEv>::new(), Vec::<C16>::new()),
+        |st, b| {
+            let (us, out, ev, ck, e2, c2) = (&mut st.0, &mut st.1, &mut st.2, &mut st.3, &mut st.4, &mut st.5);
+            ev.clear();
+            ck.clear();
+            for v in ev_srcs_r {
+                ev.extend(v.iter().filter(|x| hb(x.0) == b));
+            }
+            if ev.is_empty() {
+                return;
+            }
+            for v in ck_srcs_r {
+                ck.extend(v.iter().filter(|x| hb(x.0) == b));
+            }
+            for v in spck_r {
+                for c in v {
+                    let p = pers.of(c.uid).0;
+                    if hb(p) == b {
+                        ck.push((p, *c));
                     }
                 }
-            } else {
-                st.3.extend(sck_r[a..b].iter().map(|x| x.1));
             }
-            let name = pers.name(p, ukey);
-            sess_one(name, &st.2, &st.3, &sh_r.scx, &mut st.0.sc, &mut st.1.rows, &mut st.1.camp);
+            ev.sort_unstable_by_key(|x| (x.0, x.1.ts));
+            ck.sort_unstable_by_key(|x| (x.0, x.1.ts));
+            let mut i = 0;
+            while i < ev.len() {
+                let p = ev[i].0;
+                let mut j = i + 1;
+                while j < ev.len() && ev[j].0 == p {
+                    j += 1;
+                }
+                e2.clear();
+                e2.extend(ev[i..j].iter().map(|x| x.1));
+                c2.clear();
+                if p & (CLASS_TAG | SPEC_TAG) == 0 || (p & CLASS_TAG != 0 && pers.cuser[(p & !CLASS_TAG) as usize] != NOUSER) {
+                    // simple person routed here (pathological grouping): clicks live with its user
+                    let u = if p & CLASS_TAG != 0 { pers.cuser[(p & !CLASS_TAG) as usize] } else { (p as u32) >> 9 };
+                    let q = (u >> CSH) as usize;
+                    let lu = (u & ((1 << CSH) - 1)) as usize;
+                    if q < cq.len() && !cq[q].ofs.is_empty() {
+                        for c in &cq[q].cks[cq[q].ofs[lu] as usize..cq[q].ofs[lu + 1] as usize] {
+                            if pers.of(c.uid).0 == p {
+                                c2.push(*c);
+                            }
+                        }
+                    }
+                } else {
+                    let a = ck.partition_point(|x| x.0 < p);
+                    let bb = ck.partition_point(|x| x.0 <= p);
+                    c2.extend(ck[a..bb].iter().map(|x| x.1));
+                }
+                let name = pers.name(p, ukey);
+                sess_one(name, e2, c2, &sh_r.scx, &mut us.sc, &mut out.rows, &mut out.camp);
+                i = j;
+            }
         },
     );
     outs.extend(sout.into_iter().map(|s| s.1));
