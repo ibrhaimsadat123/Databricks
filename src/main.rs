@@ -1720,7 +1720,105 @@ pub(crate) fn default_threads() -> usize {
     n.clamp(1, 8)
 }
 
+
+fn probe17() {
+    let t0 = std::time::Instant::now();
+    eprintln!("P17 threads default {}", default_threads());
+    let mkdata = |g: &str, ev: &str, ck: &str| {
+        let _ = std::fs::remove_dir_all(g);
+        let tg = std::time::Instant::now();
+        let st = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", ev, "--clicks", ck, "--output", g]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        eprintln!("P17 gen {ev} ok={:?} {:.1}s", st.map(|s| s.success()), tg.elapsed().as_secs_f64());
+    };
+    let run = |g: &str, env: &[(&str, &str)]| -> (f64, String) {
+        let _ = std::fs::remove_dir_all("/scratch/o");
+        let t = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/app/sess");
+        cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", "/scratch/o");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output();
+        let wall = t.elapsed().as_secs_f64();
+        let mut d: Vec<String> = vec![];
+        let mut prev = 0.0;
+        if let Ok(o) = out {
+            for l in String::from_utf8_lossy(&o.stderr).lines() {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                if let Some(i) = w.iter().position(|x| *x == "wall") {
+                    let x = w.get(i + 1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(-1.0);
+                    let sy = w.get(i + 5).map(|x| x.trim_start_matches('+')).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                    d.push(format!("{:.0}{}", (x - prev) * 1000.0, if sy >= 0.05 { format!("s{:.1}", sy) } else { String::new() }));
+                    prev = x;
+                }
+                if l.contains("declined") {
+                    d.push("DECLINED".into());
+                }
+            }
+        }
+        (wall, d.join("/"))
+    };
+    let st = |v: &mut Vec<f64>| -> String {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        format!("{:.3}/{:.3}", v[0], v[v.len() / 2])
+    };
+    mkdata("/scratch/g20", "20000000", "5000000");
+    let g = "/scratch/g20";
+    let _ = run(g, &[]);
+    let cfgs: [(&str, &[(&str, &str)]); 7] = [
+        ("base", &[]),
+        ("early0", &[("SESS_EARLY", "0")]),
+        ("pfd0", &[("SESS_PFD", "0")]),
+        ("c512k", &[("SESS_CHUNK", "524288")]),
+        ("segf8", &[("SESS_SEGF", "8")]),
+        ("nothp", &[("MIMALLOC_ALLOW_THP", "0")]),
+        ("ev4", &[("SESS_VAR", "200")]),
+    ];
+    let mut ft: Vec<Vec<f64>> = vec![vec![]; cfgs.len()];
+    let mut last: Vec<String> = vec![String::new(); cfgs.len()];
+    for _ in 0..3 {
+        for (i, (_, env)) in cfgs.iter().enumerate() {
+            let (w, d) = run(g, env);
+            ft[i].push(w);
+            last[i] = d;
+        }
+    }
+    for (i, (name, _)) in cfgs.iter().enumerate() {
+        eprintln!("P17 20M {name} {} [{}]", st(&mut ft[i]), last[i]);
+    }
+    let _ = std::fs::remove_dir_all(g);
+    mkdata("/scratch/g60", "60000000", "15000000");
+    let g = "/scratch/g60";
+    let (w0, d0) = run(g, &[]);
+    eprintln!("P17 60M warmup {:.3} [{}]", w0, d0);
+    let cfgs: [(&str, &[(&str, &str)]); 5] = [
+        ("base", &[]),
+        ("early0", &[("SESS_EARLY", "0")]),
+        ("psh15", &[("SESS_PSH", "15")]),
+        ("psh17", &[("SESS_PSH", "17")]),
+        ("segf8", &[("SESS_SEGF", "8")]),
+    ];
+    let mut ft: Vec<Vec<f64>> = vec![vec![]; cfgs.len()];
+    let mut last: Vec<String> = vec![String::new(); cfgs.len()];
+    for _ in 0..2 {
+        for (i, (_, env)) in cfgs.iter().enumerate() {
+            let (w, d) = run(g, env);
+            ft[i].push(w);
+            last[i] = d;
+        }
+    }
+    for (i, (name, _)) in cfgs.iter().enumerate() {
+        eprintln!("P17 60M {name} {} [{}]", st(&mut ft[i]), last[i]);
+    }
+    let _ = std::fs::remove_dir_all(g);
+    eprintln!("P17 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::env::var_os("SESS_NO_DISPATCH").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe17();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
