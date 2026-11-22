@@ -1632,7 +1632,269 @@ fn fuzz_rows() {
     eprintln!("fuzz_rows done: {total} valid rows compared, mismatching chunks: {bad}");
 }
 
+/// Worker threads when NCPU is not set: the CPUs this process may run on (the scorer pins 8
+/// vCPUs), at most 8. A cgroup CPU quota is deliberately not consulted.
+pub(crate) fn default_threads() -> usize {
+    let mut n = 0usize;
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+            n = libc::CPU_COUNT(&set) as usize;
+        }
+    }
+    if n == 0 {
+        n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    }
+    n.clamp(1, 8)
+}
+
+
+fn p15_read(p: &str) -> String {
+    std::fs::read_to_string(p).map(|s| s.trim().replace('\n', " ")).unwrap_or_else(|e| format!("ERR({e})"))
+}
+
+fn p15_vmstat() -> Vec<(String, i64)> {
+    let want = ["compact_stall", "compact_fail", "compact_success", "thp_fault_alloc", "thp_fault_fallback", "pgmajfault", "pswpin", "pswpout", "nr_dirty", "nr_writeback", "pgsteal_direct", "allocstall_normal", "allocstall_movable"];
+    let s = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    let mut v = vec![];
+    for l in s.lines() {
+        let mut it = l.split_whitespace();
+        if let (Some(k), Some(x)) = (it.next(), it.next()) {
+            if want.contains(&k) {
+                v.push((k.to_string(), x.parse().unwrap_or(-1)));
+            }
+        }
+    }
+    v
+}
+
+fn p15_vmdelta(a: &[(String, i64)], b: &[(String, i64)]) -> String {
+    let mut out = vec![];
+    for (k, x) in b {
+        if let Some((_, y)) = a.iter().find(|(kk, _)| kk == k) {
+            if x - y != 0 && !k.starts_with("nr_") {
+                out.push(format!("{k}+{}", x - y));
+            }
+        }
+    }
+    out.join(",")
+}
+
+fn probe15() {
+    let t0 = std::time::Instant::now();
+    // ---- environment ----
+    eprintln!("P15 kern {} | thp {} | defrag {} | khp_defrag {}", p15_read("/proc/sys/kernel/osrelease"), p15_read("/sys/kernel/mm/transparent_hugepage/enabled"), p15_read("/sys/kernel/mm/transparent_hugepage/defrag"), p15_read("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag"));
+    eprintln!("P15 threads default {} ", default_threads());
+    eprintln!("P15 nproc {:?} | cpu.max {} | mem.max {} | mem.high {} | cpuset {} | dirty_ratio {} bg {} dirty_bytes {}", std::thread::available_parallelism().map(|n| n.get()), p15_read("/sys/fs/cgroup/cpu.max"), p15_read("/sys/fs/cgroup/memory.max"), p15_read("/sys/fs/cgroup/memory.high"), p15_read("/sys/fs/cgroup/cpuset.cpus.effective"), p15_read("/proc/sys/vm/dirty_ratio"), p15_read("/proc/sys/vm/dirty_background_ratio"), p15_read("/proc/sys/vm/dirty_bytes"));
+    {
+        let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let keys = ["MemTotal", "MemFree", "MemAvailable", "Cached", "Shmem", "Dirty", "Writeback", "SwapTotal", "SwapFree", "AnonHugePages", "ShmemHugePages"];
+        let mut o = String::new();
+        for l in mi.lines() {
+            let k = l.split(':').next().unwrap_or("");
+            if keys.contains(&k) {
+                let mb = l.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0) / 1024;
+                o += &format!(" {k}={mb}M");
+            }
+        }
+        eprintln!("P15 mem{o}");
+    }
+    {
+        let mi = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mut o = String::new();
+        for l in mi.lines() {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            if w.len() < 5 {
+                continue;
+            }
+            let mp = w[4];
+            if ["/", "/data", "/output", "/scratch", "/tmp", "/dev/shm"].contains(&mp) {
+                let dash = w.iter().position(|x| *x == "-").unwrap_or(0);
+                let fstype = w.get(dash + 1).unwrap_or(&"?");
+                let src = w.get(dash + 2).unwrap_or(&"?");
+                let sopt = w.get(dash + 3).unwrap_or(&"?");
+                o += &format!(" [{mp} {fstype} {src} {} {}]", w[5], &sopt[..sopt.len().min(60)]);
+            }
+        }
+        eprintln!("P15 mounts{o}");
+    }
+    eprintln!("P15 buddy {}", p15_read("/proc/buddyinfo").split("Node").map(|x| x.split_whitespace().skip(3).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
+    let vm0 = p15_vmstat();
+    eprintln!("P15 vm0 {}", vm0.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","));
+    {
+        let mut n = 0u64;
+        let mut b = 0u64;
+        for d in ["events", "clicks", "links"] {
+            if let Ok(rd) = std::fs::read_dir(format!("/data/{d}")) {
+                for e in rd.flatten() {
+                    n += 1;
+                    b += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        eprintln!("P15 data files {n} bytes {}", b);
+    }
+
+    // ---- child runner ----
+    let run = |g: &str, out: &str, env: &[(&str, &str)]| -> (f64, String, String) {
+        let _ = std::fs::remove_dir_all(format!("{out}/user_daily"));
+        let _ = std::fs::remove_dir_all(format!("{out}/campaign_daily"));
+        let v0 = p15_vmstat();
+        let t = std::time::Instant::now();
+        let mut cmd = std::process::Command::new("/app/sess");
+        cmd.env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", g).env("OUTPUT_DIR", out);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let o = cmd.output();
+        let wall = t.elapsed().as_secs_f64();
+        let v1 = p15_vmstat();
+        let mut d: Vec<String> = vec![];
+        let mut prev = 0.0;
+        let mut flt = 0i64;
+        if let Ok(o) = o {
+            if !o.status.success() {
+                d.push(format!("EXIT{:?}", o.status.code()));
+            }
+            for l in String::from_utf8_lossy(&o.stderr).lines() {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                if let Some(i) = w.iter().position(|x| *x == "wall") {
+                    let x = w.get(i + 1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(-1.0);
+                    let sy = w.get(i + 5).map(|x| x.trim_start_matches('+')).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                    flt += w.get(i + 7).map(|x| x.trim_start_matches('+')).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+                    d.push(format!("{:.0}{}", (x - prev) * 1000.0, if sy >= 0.05 { format!("s{:.1}", sy) } else { String::new() }));
+                    prev = x;
+                }
+                if l.contains("declined") {
+                    d.push("DECLINED".into());
+                }
+            }
+        }
+        d.push(format!("f{}", flt));
+        (wall, d.join("/"), p15_vmdelta(&v0, &v1))
+    };
+    let st = |v: &mut Vec<f64>| -> String {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        format!("{:.3}/{:.3}/{:.3}", v[0], v[v.len() / 2], v[v.len() - 1])
+    };
+    let _ = std::fs::create_dir_all("/scratch/o");
+
+    // ---- dev set on /data: read vs mmap, THP on/off; output to /scratch/o ----
+    let cfgs: [(&str, &[(&str, &str)]); 4] = [
+        ("mmap_thp", &[("NCPU", "8"), ("SESS_MAP2", "1")]),
+        ("read_thp", &[("NCPU", "8"), ("SESS_MAP2", "0")]),
+        ("mmap_nothp", &[("NCPU", "8"), ("SESS_MAP2", "1"), ("MIMALLOC_ALLOW_THP", "0")]),
+        ("read_nothp", &[("NCPU", "8"), ("SESS_MAP2", "0"), ("MIMALLOC_ALLOW_THP", "0")]),
+    ];
+    let mut ft: Vec<Vec<f64>> = vec![vec![]; cfgs.len()];
+    let mut last: Vec<(String, String)> = vec![Default::default(); cfgs.len()];
+    for _ in 0..5 {
+        for (i, (_, env)) in cfgs.iter().enumerate() {
+            let (w, d, vd) = run("/data", "/scratch/o", env);
+            ft[i].push(w);
+            last[i] = (d, vd);
+        }
+    }
+    for (i, (name, _)) in cfgs.iter().enumerate() {
+        eprintln!("P15 dev {name} {} [{}] {{{}}}", st(&mut ft[i]), last[i].0, last[i].1);
+    }
+    // ---- dev set with output to /output (what the scorer does) ----
+    {
+        let mut a = vec![];
+        let mut b = vec![];
+        let mut la = (String::new(), String::new());
+        for _ in 0..5 {
+            let (w, d, vd) = run("/data", "/output", &[]);
+            a.push(w);
+            la = (d, vd);
+            let (w2, _, _) = run("/data", "/output", &[("SESS_MAP2", "1")]);
+            b.push(w2);
+        }
+        eprintln!("P15 dev->/output default(read) {} [{}] {{{}}} | mmap {}", st(&mut a), la.0, la.1, st(&mut b));
+    }
+    // ---- raw write speed: 96 MB in 1 MB writes ----
+    for dir in ["/output", "/scratch"] {
+        use std::io::Write;
+        let p = format!("{dir}/p15.bin");
+        let buf = vec![0x5Au8; 1 << 20];
+        let v0 = p15_vmstat();
+        let t = std::time::Instant::now();
+        let mut worst = 0f64;
+        let res = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&p)?;
+            for _ in 0..96 {
+                let t1 = std::time::Instant::now();
+                f.write_all(&buf)?;
+                worst = worst.max(t1.elapsed().as_secs_f64());
+            }
+            Ok(())
+        })();
+        let w = t.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        let _ = std::fs::remove_file(&p);
+        let rm = t2.elapsed().as_secs_f64();
+        eprintln!("P15 write {dir} 96MB {:.3}s worst1MB {:.4}s rm {:.3}s {:?} {{{}}}", w, worst, rm, res.err(), p15_vmdelta(&v0, &p15_vmstat()));
+    }
+
+    // ---- 20M generated into /scratch ----
+    let g = "/scratch/g20";
+    let _ = std::fs::remove_dir_all(g);
+    let tg = std::time::Instant::now();
+    let stg = std::process::Command::new("/app/generate").args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output", g]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    eprintln!("P15 gen20 ok={:?} {:.1}s", stg.map(|s| s.success()), tg.elapsed().as_secs_f64());
+    // warm-up run (page cache of the freshly written files), not reported
+    let (w0, d0, vd0) = run(g, "/scratch/o", &[("NCPU", "8")]);
+    eprintln!("P15 20M warmup {:.3} [{}] {{{}}}", w0, d0, vd0);
+    let cfgs: [(&str, &[(&str, &str)]); 4] = [
+        ("mmap_thp", &[("NCPU", "8"), ("SESS_MAP2", "1")]),
+        ("read_thp", &[("NCPU", "8"), ("SESS_MAP2", "0")]),
+        ("read_nothp", &[("NCPU", "8"), ("SESS_MAP2", "0"), ("MIMALLOC_ALLOW_THP", "0")]),
+        ("mmap_nothp", &[("NCPU", "8"), ("SESS_MAP2", "1"), ("MIMALLOC_ALLOW_THP", "0")]),
+    ];
+    let mut ft: Vec<Vec<f64>> = vec![vec![]; cfgs.len()];
+    let mut last: Vec<(String, String)> = vec![Default::default(); cfgs.len()];
+    for _ in 0..3 {
+        for (i, (_, env)) in cfgs.iter().enumerate() {
+            let (w, d, vd) = run(g, "/scratch/o", env);
+            ft[i].push(w);
+            last[i] = (d, vd);
+        }
+    }
+    for (i, (name, _)) in cfgs.iter().enumerate() {
+        eprintln!("P15 20M {name} {} [{}] {{{}}}", st(&mut ft[i]), last[i].0, last[i].1);
+    }
+    // 20M with the 94 MB output going to /output, and with no NCPU (thread count chosen by the program)
+    {
+        let mut a = vec![];
+        let mut la = (String::new(), String::new());
+        for _ in 0..3 {
+            let (w, d, vd) = run(g, "/output", &[]);
+            a.push(w);
+            la = (d, vd);
+        }
+        eprintln!("P15 20M ->/output default(read,no NCPU) {} [{}] {{{}}}", st(&mut a), la.0, la.1);
+        let mut b = vec![];
+        let mut lb = (String::new(), String::new());
+        for _ in 0..3 {
+            let (w, d, vd) = run(g, "/output", &[("SESS_MAP2", "1")]);
+            b.push(w);
+            lb = (d, vd);
+        }
+        eprintln!("P15 20M ->/output mmap(no NCPU) {} [{}] {{{}}}", st(&mut b), lb.0, lb.1);
+    }
+    let _ = std::fs::remove_dir_all("/output/user_daily");
+    let _ = std::fs::remove_dir_all("/output/campaign_daily");
+    let _ = std::fs::remove_dir_all(g);
+    let vm1 = p15_vmstat();
+    eprintln!("P15 vmΔ {} | buddy {}", p15_vmdelta(&vm0, &vm1), p15_read("/proc/buddyinfo").split("Node").map(|x| x.split_whitespace().skip(3).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" | "));
+    eprintln!("P15 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::env::var_os("SESS_NO_DISPATCH").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe15();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
@@ -1668,22 +1930,22 @@ fn main() {
     let t0 = std::time::Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let nt: usize = std::env::var("NCPU")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
-        .max(1);
+    let nt: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or_else(default_threads).max(1);
     let verbose = std::env::var("VERBOSE").is_ok();
-    let last = std::cell::Cell::new((0f64, 0f64));
+    if verbose {
+        eprintln!("threads {nt} (default {})", default_threads());
+    }
+    let last = std::cell::Cell::new((0f64, 0f64, 0i64));
     let log = |m: &str| {
         if verbose {
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
             unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
             let u = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6;
             let sy = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6;
-            let (pu, ps) = last.get();
-            last.set((u, sy));
-            eprintln!("{m:12} wall {:6.3}  user +{:.2}  sys +{:.2}", t0.elapsed().as_secs_f64(), u - pu, sy - ps);
+            let fl = ru.ru_minflt as i64;
+            let (pu, ps, pf) = last.get();
+            last.set((u, sy, fl));
+            eprintln!("{m:12} wall {:6.3}  user +{:.2}  sys +{:.2}  flt +{}", t0.elapsed().as_secs_f64(), u - pu, sy - ps, fl - pf);
         }
     };
 

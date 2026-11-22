@@ -13,7 +13,7 @@ static NSLOWC: AtomicU64 = AtomicU64::new(0);
 const K_PF: usize = 1024;
 static K_VAR: LazyLock<u32> = LazyLock::new(|| knob("SESS_VAR", 200) as u32);
 static K_CHUNK: LazyLock<usize> = LazyLock::new(|| knob("SESS_CHUNK", 1 << 20));
-static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 1) != 0);
+static K_MAP2: LazyLock<bool> = LazyLock::new(|| knob("SESS_MAP2", 0) != 0);
 static K_S2: LazyLock<bool> = LazyLock::new(|| knob("SESS_S2", 1) != 0);
 static K_POP: LazyLock<bool> = LazyLock::new(|| knob("SESS_POP", 0) != 0);
 static K_PARTS: LazyLock<usize> = LazyLock::new(|| knob("SESS_PARTS", 1024).max(16));
