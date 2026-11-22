@@ -1720,7 +1720,72 @@ pub(crate) fn default_threads() -> usize {
     n.clamp(1, 8)
 }
 
+
+fn p19_lines(path: &std::path::Path, skip: usize, n: usize, maxc: usize) -> Vec<String> {
+    let b = std::fs::read(path).unwrap_or_default();
+    let mut out = vec![];
+    for (i, l) in b.split(|&c| c == b'\n').enumerate() {
+        if i < skip {
+            continue;
+        }
+        if out.len() >= n {
+            break;
+        }
+        let s = String::from_utf8_lossy(&l[..l.len().min(maxc)]).to_string();
+        out.push(s.replace('\r', "\\r"));
+    }
+    out
+}
+
+fn probe19() {
+    let t0 = std::time::Instant::now();
+    // 1. why the fast path declines on /data
+    let o = std::process::Command::new("/app/sess").env("CHILD", "1").env("VERBOSE", "1").env("DATA_DIR", "/data").env("OUTPUT_DIR", "/scratch/o19").env("NCPU", "8").output();
+    let mut why = String::from("?");
+    let mut phases = vec![];
+    if let Ok(o) = &o {
+        for l in String::from_utf8_lossy(&o.stderr).lines() {
+            if l.contains("declined") {
+                why = l.to_string();
+            }
+            if l.contains(" wall ") {
+                phases.push(l.split_whitespace().next().unwrap_or("").to_string());
+            }
+        }
+    }
+    eprintln!("P19 why: {why} | phases {}", phases.join(","));
+    let man = std::fs::read_to_string("/data/manifest.json").unwrap_or_default();
+    eprintln!("P19 manifest: {}", man.split_whitespace().collect::<Vec<_>>().join(" "));
+    for d in ["events", "clicks", "links"] {
+        let mut v: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(format!("/data/{d}")).map(|rd| rd.flatten().map(|e| (e.metadata().map(|m| m.len()).unwrap_or(0), e.path())).collect()).unwrap_or_default();
+        v.sort();
+        let tot: u64 = v.iter().map(|x| x.0).sum();
+        let names: Vec<String> = v.iter().take(2).map(|x| x.1.file_name().unwrap().to_string_lossy().to_string()).collect();
+        eprintln!("P19 {d}: {} files {} bytes, smallest {:?}", v.len(), tot, names);
+        if let Some((_, p)) = v.last() {
+            let n = if d == "events" { 7 } else { 3 };
+            for l in p19_lines(p, 0, n, 110) {
+                eprintln!("P19 {d}| {l}");
+            }
+        }
+    }
+    for f in ["products.csv", "campaigns.csv"] {
+        let p = std::path::Path::new("/data").join(f);
+        let all = std::fs::read(&p).unwrap_or_default();
+        let nl = all.iter().filter(|&&c| c == b'\n').count();
+        eprintln!("P19 {f}: {} bytes {} lines | {}", all.len(), nl, p19_lines(&p, 0, 3, 80).join(" || "));
+    }
+    let other: Vec<String> = std::fs::read_dir("/data").map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
+    eprintln!("P19 /data entries: {:?}", other);
+    eprintln!("P19 why(again): {why}");
+    eprintln!("P19 total {:.1}s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
+    if std::env::var_os("CHILD").is_none() && std::env::var_os("SESS_NO_DISPATCH").is_none() && std::path::Path::new("/app/generate").exists() {
+        probe19();
+        std::process::exit(3);
+    }
     if std::env::var("FUZZROWS").is_ok() { fuzz_rows(); return; }
     // Hand off to the AVX-512 build when the CPU supports it (the entry binary is the
     // AVX2 build, so a machine without AVX-512 never executes an AVX-512 instruction).
