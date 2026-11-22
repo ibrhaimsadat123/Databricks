@@ -1354,6 +1354,39 @@ fn run<S: Send>(nt: usize, ntasks: usize, init: impl Fn(usize) -> S + Sync, f: i
     })
 }
 
+/// `run`, and then every thread calls `fin(state, tid)` once it finds no task left (while other
+/// threads may still be working on theirs)
+fn run_fin<S: Send>(nt: usize, ntasks: usize, init: impl Fn(usize) -> S + Sync, f: impl Fn(&mut S, usize) + Sync, fin: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt)
+            .map(|tid| {
+                let init = &init;
+                let f = &f;
+                let fin = &fin;
+                let next = &next;
+                sc.spawn(move || {
+                    let mut s = init(tid);
+                    loop {
+                        let t = next.fetch_add(1, AO::Relaxed);
+                        if t >= ntasks {
+                            break;
+                        }
+                        f(&mut s, t);
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            std::arch::x86_64::_mm_sfence();
+                        }
+                    }
+                    fin(&mut s, tid);
+                    s
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 // ---------- records ----------
 #[derive(Clone, Copy, Default)]
 #[repr(align(32))]
@@ -1748,6 +1781,9 @@ fn main() {
             if verbose {
                 eprintln!("fast path declined: {why}");
             }
+            // the fast path may have written some parts already
+            let _ = std::fs::remove_dir_all(outdir.join("user_daily"));
+            let _ = std::fs::remove_dir_all(outdir.join("campaign_daily"));
         }
     }
     let manifest = String::from_utf8_lossy(&read_small(&data.join("manifest.json"))).to_string();

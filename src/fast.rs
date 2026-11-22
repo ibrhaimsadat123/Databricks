@@ -3944,6 +3944,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         pieces: Vec<(usize, u8, u32, Vec<UEv>)>,
         meta: Vec<(usize, u32, u32)>,
         bad: bool,
+        wrote: bool,
     }
     let new_out = || Out { rows: Vec::with_capacity(est / nt / 8 + 64), camp: vec![[0; 4]; ncamp * ndays], side: vec![] };
     let new_us = || {
@@ -3963,10 +3964,18 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         }
     }
     let evov_r = &evov;
-    let sb = run(
+    // output directories now: a phase B thread writes its user_daily part as soon as it runs out
+    // of segments (other threads are still busy); a later decline removes them again
+    let ud = outdir.join("user_daily");
+    let cd = outdir.join("campaign_daily");
+    std::fs::create_dir_all(&ud).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&cd).map_err(|e| e.to_string())?;
+    let (ud_r, cat_names_r) = (&ud, &cat_names);
+    let early = std::env::var_os("SESS_OLDPQ").is_none() && knob("SESS_EARLY", 1) != 0;
+    let sb = run_fin(
         nt,
         nseg,
-        |_| SB { slot: vec![], dense: vec![DRec { meta: 0, uid: 0, ts: 0, ingest: i32::MAX }; 1 << psh], pbuf: vec![], cur: vec![], blk: vec![], bnd: vec![], us: new_us(), out: new_out(), pieces: vec![], meta: vec![], bad: false },
+        |_| SB { slot: vec![], dense: vec![DRec { meta: 0, uid: 0, ts: 0, ingest: i32::MAX }; 1 << psh], pbuf: vec![], cur: vec![], blk: vec![], bnd: vec![], us: new_us(), out: new_out(), pieces: vec![], meta: vec![], bad: false, wrote: false },
         |st, s| {
             if st.bad {
                 return;
@@ -4108,9 +4117,20 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             }
             st.meta.push((s, first_user, cur_user));
         },
+        |st, tid| {
+            if early && !st.bad && !st.out.rows.is_empty() {
+                write_user_pq(&ud_r.join(format!("part-{tid:03}.parquet")), &st.out.rows, cat_names_r).unwrap();
+                st.out.rows = vec![];
+                st.wrote = true;
+            }
+        },
     );
     if sb.iter().any(|s| s.bad) {
         return Err("user order".into());
+    }
+    if std::env::var_os("SESS_FAILLATE").is_some() {
+        // test hook: decline after the early user_daily parts were written
+        return Err("test decline after phase B".into());
     }
     // segment order check and boundary merge
     let mut meta: Vec<(usize, u32, u32)> = sb.iter().flat_map(|s| s.meta.iter().copied()).collect();
@@ -4164,6 +4184,7 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
     log("users");
 
     // ---- side path: complex persons ----
+    let early_parts = sb.iter().filter(|s| s.wrote).count();
     let mut outs: Vec<Out> = sb.into_iter().map(|s| s.out).collect();
     outs.extend(fix.into_iter().map(|s| s.1));
     outs.push(left_out);
@@ -4257,14 +4278,11 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             }
         }
     }
-    let ud = outdir.join("user_daily");
-    let cd = outdir.join("campaign_daily");
-    std::fs::create_dir_all(&ud).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&cd).map_err(|e| e.to_string())?;
     std::thread::scope(|scope| {
-        let mut g = 0usize;
+        // parts written in phase B are part-000..part-{nt-1}; the rest continue from nt
+        let mut g = if early_parts > 0 { nt } else { 0 };
         for o in outs.iter() {
-            if o.rows.is_empty() && g > 0 {
+            if o.rows.is_empty() && (g > 0 || early_parts > 0) {
                 continue;
             }
             let ud = &ud;
