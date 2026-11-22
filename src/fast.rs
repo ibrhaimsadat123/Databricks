@@ -724,8 +724,19 @@ struct Persons {
     spec_class: FxHashMap<u32, u32>,
     cname: Vec<u64>,
     cuser: Vec<u32>,
+    /// bit per user index: some uid of that user is in a class spanning several users
+    /// (empty: unknown, every lookup goes through of())
+    cbits: Vec<u64>,
 }
 impl Persons {
+    /// false only when no uid of user index `user` can belong to a complex person
+    #[inline(always)]
+    fn maybe_complex(&self, user: u32) -> bool {
+        match self.cbits.get((user >> 6) as usize) {
+            Some(w) => (w >> (user & 63)) & 1 != 0,
+            None => true,
+        }
+    }
     #[inline(always)]
     fn class_of(&self, u: u32) -> u32 {
         let (user, alias) = (u >> 9, u & 511);
@@ -868,7 +879,28 @@ fn build_persons2(lparts: &[(Vec<u8>, Vec<(u64, u64, u64, u64)>)]) -> Persons {
             ptab.insert(id as u32, c as u32);
         }
     }
-    Persons { dtab, du, ptab, spec_class, cname, cuser }
+    // users touched by complex classes
+    let mut cbits = vec![0u64; ((1usize << 22) + 63) / 64];
+    for i in 0..n {
+        if parent[i] == u32::MAX {
+            continue;
+        }
+        let c = cls[find(&mut parent, i as u32) as usize] as usize;
+        if cuser[c] != NOUSER {
+            continue;
+        }
+        let id = if i < nd { (((i as u32) / AS) as u64) << 9 | ((i as u32) % AS) as u64 } else { over_ids[i - nd] };
+        if id & SPEC_TAG == 0 {
+            let u = (id >> 9) as usize;
+            if u < (1 << 22) {
+                cbits[u >> 6] |= 1 << (u & 63);
+            } else {
+                cbits.clear();
+                break;
+            }
+        }
+    }
+    Persons { dtab, du, ptab, spec_class, cname, cuser, cbits }
 }
 
 /// link ID -> (id, name key): id is the uid number (< 2^31) or SPEC_TAG | special index
@@ -942,7 +974,7 @@ fn build_persons(lparts: &[(Vec<u8>, Vec<(u64, u64, u64, u64)>)]) -> Persons {
             ptab.insert(ids[i] as u32, c as u32);
         }
     }
-    Persons { dtab: vec![], du: 0, ptab, spec_class, cname, cuser }
+    Persons { dtab: vec![], du: 0, ptab, spec_class, cname, cuser, cbits: vec![] }
 }
 
 // ---------- sessions for one person ----------
@@ -3086,16 +3118,35 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             };
             let e = strip(fs[0]);
             let u = strip(fs[1]);
+            let xu = if u.len() >= 2 && u[0] == b'u' { b36_safe(&u[1..]) } else { None };
             if e.len() >= 2 && e[0] == b'e' {
                 if let Some(x) = b36_safe(&e[1..]) {
-                    em.push(unmix(x));
+                    em.push((unmix(x), xu));
                 }
             }
-            if u.len() >= 2 && u[0] == b'u' {
-                if let Some(x) = b36_safe(&u[1..]) {
-                    um.push(unmix(x));
+            if let Some(x) = xu {
+                um.push(unmix(x));
+            }
+        }
+        // Anchors that are likely to have small indexes make the searches short: the most
+        // frequent user IDs first (heavy users, whose first ID carries half their rows), then
+        // events of the users with the smallest index (any order is correct, only slower).
+        {
+            let mut freq: FxHashMap<u64, u32> = FxHashMap::default();
+            for &m in &um {
+                *freq.entry(m).or_insert(0) += 1;
+            }
+            um.sort_by_key(|m| std::cmp::Reverse(freq[m]));
+            let mut seen = rustc_hash::FxHashSet::default();
+            let mut head: Vec<u64> = vec![];
+            for &m in &um {
+                if head.len() < 16 && seen.insert(m) {
+                    head.push(m);
                 }
             }
+            let mut rest: Vec<u64> = um.iter().copied().filter(|m| !head.contains(m)).collect();
+            head.append(&mut rest);
+            um = head;
         }
         if lines < 100 {
             return Err("sample".into());
@@ -3103,9 +3154,15 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
         let avg = bytes as f64 / lines as f64;
         let est_lines = (total_ev as f64 / avg) as u64 + 1024;
         let vb = est_lines * 3 / 2 + 4096;
-        let Some(ek) = search_key(&em, 1, vb, vb, nt) else { return Err("event key".into()) };
         let ub = est_lines / 15 + 4096;
         let Some(uk) = search_key(&um, 512, ub, ub * 512, nt) else { return Err("user key".into()) };
+        let mut em: Vec<(u64, u64)> = em
+            .iter()
+            .map(|&(m, xu)| (m, xu.map(|x| unscr(x, uk)).filter(|&n| n < (1 << 31)).map(|n| n >> 9).unwrap_or(u64::MAX)))
+            .collect();
+        em.sort_by_key(|x| x.1);
+        let em: Vec<u64> = em.into_iter().map(|x| x.0).collect();
+        let Some(ek) = search_key(&em, 1, vb, vb, nt) else { return Err("event key".into()) };
         (ek, uk, est_lines)
     };
     // click key from a sample of the largest clicks file
@@ -3127,14 +3184,23 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             if fs.len() != 4 {
                 continue;
             }
-            let x = fs[0];
-            let x = if x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"' { &x[1..x.len() - 1] } else { x };
+            let unq = |x: &'_ [u8]| -> Vec<u8> { if x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"' { x[1..x.len() - 1].to_vec() } else { x.to_vec() } };
+            let x = unq(fs[0]);
+            let u = unq(fs[1]);
             if x.len() >= 2 && x[0] == b'k' {
                 if let Some(v) = b36_safe(&x[1..]) {
-                    cm.push(unmix(v));
+                    // clicks of the users with the smallest index first (small click indexes)
+                    let user = if u.len() >= 2 && u[0] == b'u' {
+                        b36_safe(&u[1..]).map(|xu| unscr(xu, ukey)).filter(|&n| n < (1 << 31)).map(|n| n >> 9).unwrap_or(u64::MAX)
+                    } else {
+                        u64::MAX
+                    };
+                    cm.push((unmix(v), user));
                 }
             }
         }
+        cm.sort_by_key(|x| x.1);
+        let cm: Vec<u64> = cm.into_iter().map(|x| x.0).collect();
         if lines < 100 {
             return Err("click sample".into());
         }
@@ -3411,15 +3477,17 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
             let mut kept = 0usize;
             for s in sa_r.iter() {
                 let v = &s.ck[q];
-                for (j, c) in v.iter().enumerate() {
-                    if j + 8 < v.len() {
-                        pers.prefetch(v[j + 8].uid);
-                    }
-                    let (p, complex) = pers.of(c.uid);
+                for c in v.iter() {
+                    // only users touched by a complex person need the full lookup
+                    let complex = pers.maybe_complex(c.uid >> 9) && {
+                        let (p, cx) = pers.of(c.uid);
+                        if cx {
+                            side.push((p, *c));
+                        }
+                        cx
+                    };
                     cplx.push(complex);
-                    if complex {
-                        side.push((p, *c));
-                    } else {
+                    if !complex {
                         cnt[((c.uid >> 9) - base) as usize + 1] += 1;
                         kept += 1;
                     }
@@ -4097,20 +4165,23 @@ fn write_user_pq(path: &Path, rows: &[UserRow], cat_names: &[Vec<u8>]) -> std::i
     let mut rev = Col::new("revenue_cents", K::I64, n * 8);
     let mut top = Col::new("top_category", K::OptStr, n * 6);
     top.defs.reserve(n);
+    uid.data.reserve(16);
     for r in rows {
         let k = r.person;
         if k & FALLBACK == 0 {
-            let mut b = [0u8; 9];
-            let mut len = 0;
-            while len < 9 {
-                let c = ((k >> (7 * (8 - len))) & 0x7F) as u8;
-                if c == 0 {
-                    break;
-                }
-                b[len] = c;
-                len += 1;
+            // nine 7-bit chars, the first in bits 56..63: spread chars 1..8 into bytes with pdep
+            let c0 = (k >> 56) & 0x7F;
+            let rest = unsafe { _pdep_u64(k, 0x7F7F_7F7F_7F7F_7F7F) }.swap_bytes(); // chars 1..8
+            let z = rest.wrapping_sub(0x0101_0101_0101_0101) & !rest & 0x8080_8080_8080_8080;
+            let len = if c0 == 0 { 0 } else { 1 + (z.trailing_zeros() as usize >> 3).min(8) };
+            uid.data.reserve(4 + 16);
+            unsafe {
+                let p = uid.data.as_mut_ptr().add(uid.data.len());
+                std::ptr::write_unaligned(p as *mut u32, len as u32);
+                std::ptr::write_unaligned(p.add(4) as *mut u64, c0 | (rest << 8));
+                *p.add(12) = (rest >> 56) as u8;
+                uid.data.set_len(uid.data.len() + 4 + len);
             }
-            uid.put_str(&b[..len]);
         } else {
             uid.put_str(&key_bytes(k));
         }
