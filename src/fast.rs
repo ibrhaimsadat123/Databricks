@@ -2410,7 +2410,7 @@ fn parse_ev4<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mu
     nslow
 }
 
-fn parse_ev6<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) -> usize {
+fn parse_ev6<const K: usize, const BR3: bool>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mut Wc<DRec, K>, purs: &mut [Vec<PRec>], sparse: &mut Vec<SRec>, maxp: &mut usize) -> usize {
     assert!(buf.len() >= e + 128);
     let mut nslow = 0usize;
     let mut mp = *maxp;
@@ -2602,11 +2602,20 @@ fn parse_ev6<const K: usize>(buf: &[u8], s: usize, e: usize, cx: &EvCtx, wc: &mu
                     let off = (oh * 60 + om) as i64 * 60_000;
                     t12 = if b19 == b'+' { t12 - off } else { t12 + off };
                 }
-                // F3 decoded unconditionally and selected without a branch (the form is random per line)
-                let (v3, ok3) = d13_bl(pt);
-                let m3 = (is3 as i64).wrapping_neg();
-                let tr = ((v3 - ws) & m3) | (t12 & !m3);
-                let okt = (ok3 & is3) | (ok12 & !is3);
+                // F3: BR3 = branch on the form (fewer instructions, a mispredict on about a third of
+                // the lines); otherwise decoded unconditionally and selected without a branch
+                let (tr, okt) = if BR3 {
+                    if is3 {
+                        let (v3, ok3) = d13_bl(pt);
+                        (v3 - ws, ok3)
+                    } else {
+                        (t12, ok12)
+                    }
+                } else {
+                    let (v3, ok3) = d13_bl(pt);
+                    let m3 = (is3 as i64).wrapping_neg();
+                    (((v3 - ws) & m3) | (t12 & !m3), (ok3 & is3) | (ok12 & !is3))
+                };
                 // ---- validity ----
                 let w8 = std::ptr::read_unaligned(pk as *const u64);
                 // type: slot from bits 1..2 of the first byte ('p' 0x70 -> 0, 'c' 0x63 -> 1, 'v' 0x76 -> 3),
@@ -3627,7 +3636,8 @@ pub(crate) fn fast_main(data: &Path, outdir: &Path, nt: usize, log: &dyn Fn(&str
                         if var & 96 != 0 {
                             let n = match (var & 64 != 0, var & 8 != 0) {
                                 (true, true) if var & 512 != 0 => parse_ev5::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
-                                (true, true) if var & 1024 != 0 => parse_ev6::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                (true, true) if var & 3072 == 3072 => parse_ev6::<8, true>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
+                                (true, true) if var & 1024 != 0 => parse_ev6::<8, false>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (true, true) => parse_ev4::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (true, false) => parse_ev4::<4>(b, s, e, evcx, &mut st.wc, &mut st.purs, &mut st.sparse, &mut st.maxp),
                                 (false, true) => parse_ev3::<8>(b, s, e, evcx, &mut st.wc8, &mut st.purs, &mut st.sparse, &mut st.maxp),
@@ -4811,7 +4821,7 @@ pub(crate) fn fuzz_ev(iters: usize) {
         } else if it % 4 == 2 {
             total_slow += parse_ev5::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
         } else {
-            total_slow += parse_ev6::<4>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb);
+            total_slow += if it % 8 == 3 { parse_ev6::<4, false>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb) } else { parse_ev6::<4, true>(&buf, 0, e, &cx, &mut wb, &mut pb, &mut sb, &mut mb) };
         }
         let (oa, ob) = (wa.finish(), wb.finish());
         let dk = |r: &DRec| (r.meta, r.uid, r.ts, r.ingest);
@@ -4844,7 +4854,7 @@ pub(crate) fn fuzz_ev(iters: usize) {
                     } else if it % 4 == 2 {
                         parse_ev5::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
                     } else {
-                        parse_ev6::<4>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2);
+                        if it % 8 == 3 { parse_ev6::<4, false>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2) } else { parse_ev6::<4, true>(&one, 0, ee, &cx, &mut w2, &mut p2, &mut s2, &mut m2) };
                     }
                     let (o1, o2) = (w1.finish(), w2.finish());
                     let r1: Vec<_> = o1.iter().flatten().map(dk).collect();
